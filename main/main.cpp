@@ -26,6 +26,13 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "led_strip_encoder.h"
+#include "driver/rmt_tx.h"
+#define RMT_LED_STRIP_RESOLUTION_HZ 10000000 // 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
+#define LED_RING_PIN 48
+#define LED_NUMBERS 8
+#define CHASE_SPEED_MS 100
+static uint8_t led_strip_pixels[LED_NUMBERS * 3];
 
 #include "driver/i2c.h"
 
@@ -99,13 +106,19 @@ static int s_retry_num = 0;
 #define SDA_PIN 8
 Adafruit_SSD1306 display;
 SemaphoreHandle_t xMutex;
-
+rmt_channel_handle_t led_chan = NULL;
+rmt_encoder_handle_t led_encoder = NULL;
 bool ChargingFlag = false;
+int ledStatus = 0;
+int ledValueR = 0;
+int ledValueG = 0;
+int ledValueB = 0;
 void printCenter(const char *buf, int y);
 void printStatusBottom(const char *buf);
 void sendMessage(void *pvParameters);
 void sendStatus(void *pvParameters);
 void beepTask(void *pvParameter);
+void led_strip_hsv2rgb(uint32_t h, uint32_t saturation, uint32_t value, uint32_t *r, uint32_t *g, uint32_t *b);
 void safeFree(void **ptr)
 {
     if (ptr != NULL && *ptr != NULL)
@@ -129,8 +142,9 @@ void beep(int note, int duration, int delayms)
     {
         vTaskDelay(delayms / portTICK_PERIOD_MS);
     }
-    pinMode(BUZZER_PIN, OUTPUT);
+    // pinMode(BUZZER_PIN, OUTPUT);
     tone(BUZZER_PIN, note, duration);
+    // ledcWriteTone(BUZZER_PIN, note);
 }
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
@@ -185,6 +199,12 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         else
         {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            printStatusBottom("NTWRK FAIL SHTDWN");
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            ESP_LOGW(TAG, "SHUTDOWN");
+            beep(NOTE_A4, 80, 0);
+            beep(NOTE_A, 80, 100);
+            digitalWrite(POWER_PIN, LOW);
         }
         ESP_LOGI(TAG, "connect to the AP fail");
     }
@@ -382,6 +402,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                             int value_r = cJSON_GetObjectItem(event_data_object, "value_R")->valueint;
                             int value_g = cJSON_GetObjectItem(event_data_object, "value_G")->valueint;
                             int value_b = cJSON_GetObjectItem(event_data_object, "value_B")->valueint;
+                            ledValueR = value_r;
+                            ledValueG = value_g;
+                            ledValueB = value_b;
+                            ledStatus = 1;
                             int value_blink = cJSON_GetObjectItem(event_data_object, "value_blink")->valueint;
                             int value_blink_counter = cJSON_GetObjectItem(event_data_object, "value_blink_counter")->valueint;
                             int value_brightness = cJSON_GetObjectItem(event_data_object, "value_brightness")->valueint;
@@ -690,6 +714,74 @@ int checkRstButtonsCounter = 0;
 int rssi_counter = 0;
 int status_counter = 0;
 int charging_status_counter = 0;
+
+void ledLoop(void *pvParameters)
+{
+    uint32_t red = 0;
+    uint32_t green = 0;
+    uint32_t blue = 0;
+    uint16_t hue = 0;
+    uint16_t start_rgb = 0;
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,
+    };
+    while (1)
+    {
+        if (ledStatus == 0)
+        {
+            for (int j = 0; j < LED_NUMBERS; j += 1)
+            {
+                hue = j * 45 + start_rgb;
+                led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
+                led_strip_pixels[(j * 3 + 0)] = green;
+                led_strip_pixels[(j * 3 + 1)] = blue;
+                led_strip_pixels[(j * 3 + 2)] = red;
+            }
+        }
+        else if (ledStatus == 1)
+        {
+            for (int j = 0; j < LED_NUMBERS; j += 1)
+            {
+                hue = j * 45 + start_rgb;
+                // led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
+                led_strip_pixels[(j * 3 + 0)] = ledValueG;
+                led_strip_pixels[(j * 3 + 1)] = ledValueR;
+                led_strip_pixels[(j * 3 + 2)] = ledValueB;
+            }
+        }
+
+        ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
+        ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+        start_rgb += (360 / LED_NUMBERS);
+        vTaskDelay(CHASE_SPEED_MS / portTICK_PERIOD_MS);
+
+        // memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
+        // ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
+        // ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+        // vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS * 10));
+    }
+}
+void chargingLoop(void *pvParameters)
+{
+    while (1)
+    {
+        int bat_chg_value = analogRead(BAT_CHG);
+        int bat_stby_value = analogRead(BAT_STDBY);
+        if (!(bat_chg_value < 70 || bat_stby_value < 70))
+        {
+            ESP_LOGI(TAG, "CHARGING STOPED");
+            beep(NOTE_A6, 200, 50);
+            beep(NOTE_G6, 200, 50);
+            beep(NOTE_F6, 200, 0);
+            ChargingFlag = false;
+            printStatusBottom("CHARGING STOPED");
+            vTaskDelay(3000 / portTICK_PERIOD_MS);
+            digitalWrite(POWER_PIN, LOW);
+        }
+
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
 void loop(void *pvParameters)
 {
     while (1)
@@ -827,6 +919,53 @@ void ota_task(void *pvParameter)
     // }
     vTaskDelete(NULL);
 }
+void led_strip_hsv2rgb(uint32_t h, uint32_t saturation, uint32_t value, uint32_t *r, uint32_t *g, uint32_t *b)
+{
+    uint32_t step = 60;
+    h %= 360; // h -> [0,360]
+    uint32_t rgb_max = value * 2.55f;
+    uint32_t rgb_min = rgb_max * (100 - saturation) / 100.0f;
+
+    uint32_t i = h / step;
+    uint32_t diff = h % step;
+
+    // RGB adjustment amount by hue
+    uint32_t rgb_adj = (rgb_max - rgb_min) * diff / step;
+
+    switch (i)
+    {
+    case 0:
+        *r = rgb_max;
+        *g = rgb_min + rgb_adj;
+        *b = rgb_min;
+        break;
+    case 1:
+        *r = rgb_max - rgb_adj;
+        *g = rgb_max;
+        *b = rgb_min;
+        break;
+    case 2:
+        *r = rgb_min;
+        *g = rgb_max;
+        *b = rgb_min + rgb_adj;
+        break;
+    case 3:
+        *r = rgb_min;
+        *g = rgb_max - rgb_adj;
+        *b = rgb_max;
+        break;
+    case 4:
+        *r = rgb_min + rgb_adj;
+        *g = rgb_min;
+        *b = rgb_max;
+        break;
+    default:
+        *r = rgb_max;
+        *g = rgb_min;
+        *b = rgb_max - rgb_adj;
+        break;
+    }
+}
 
 void app_main()
 {
@@ -849,6 +988,7 @@ void app_main()
     ESP_ERROR_CHECK(esp_event_handler_register(ESP_HTTPS_OTA_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     pinMode(BAT_CHG, INPUT);
     pinMode(BAT_STDBY, INPUT);
+    // pinMode(BUZZER_PIN, OUTPUT);
     pinMode(BAT_MON_PIN, INPUT_PULLUP);
     pinMode(BUTTON_1, INPUT_PULLUP);
     pinMode(BUTTON_2, INPUT_PULLUP);
@@ -887,9 +1027,12 @@ void app_main()
         beep(NOTE_C6, 50, 0);
         beep(NOTE_C7, 50, 50);
     }
-
+    pinMode(VIBRATE_PIN, OUTPUT);
+    digitalWrite(VIBRATE_PIN, HIGH);
+    delay(1 * 1000);
     pinMode(POWER_PIN, OUTPUT);
     digitalWrite(POWER_PIN, HIGH);
+    digitalWrite(VIBRATE_PIN, LOW);
 
     display = Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
     display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
@@ -901,12 +1044,17 @@ void app_main()
     display.display();
     display.drawBitmap(24, 0, funclick_logo, 80, 50, 1);
     char ver[100]; // Ensure this is large enough to hold the final string
-
-    sprintf(ver, "VER: %s", FIRMWARE_VERSION);
-    printStatusBottom(ver);
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-
-    pinMode(BUZZER_PIN, OUTPUT);
+    if (ChargingFlag)
+    {
+        printStatusBottom("CHARGING");
+    }
+    else
+    {
+        sprintf(ver, "VER: %s", FIRMWARE_VERSION);
+        printStatusBottom(ver);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+    // pinMode(BUZZER_PIN, OUTPUT);
     pinMode(VIBRATE_PIN, OUTPUT);
     pinMode(BUTTONS_LED_R, OUTPUT);
     pinMode(BUTTONS_LED_G, OUTPUT);
@@ -927,8 +1075,10 @@ void app_main()
     digitalWrite(BUTTON_4_LED, HIGH);
     digitalWrite(BUTTON_5_LED, HIGH);
     digitalWrite(BUTTON_6_LED, HIGH);
-
-    wifi_init_sta();
+    if (!ChargingFlag)
+    {
+        wifi_init_sta();
+    }
 
     ESP_LOGI(TAG, "[APP] Startup..");
     ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
@@ -937,10 +1087,15 @@ void app_main()
     esp_log_level_set("websocket_client", ESP_LOG_VERBOSE);
     esp_log_level_set("transport_ws", ESP_LOG_VERBOSE);
     esp_log_level_set("trans_tcp", ESP_LOG_VERBOSE);
-    xTaskCreate(&ota_task, "ota_task", 8192, NULL, 1, NULL);
-
+    if (!ChargingFlag)
+    {
+        xTaskCreate(&ota_task, "ota_task", 8192, NULL, 1, NULL);
+    }
     ESP_LOGI(TAG, "webSocketTask start");
-    xTaskCreate(webSocketTask, "webSocketTask", 4096, NULL, 4, NULL);
+    if (!ChargingFlag)
+    {
+        xTaskCreate(webSocketTask, "webSocketTask", 4096, NULL, 4, NULL);
+    }
     // websocket_app_start();
     registerButton(BUTTON_1, 1);
     registerButton(BUTTON_2, 2);
@@ -949,10 +1104,30 @@ void app_main()
     registerButton(BUTTON_5, 5);
     registerButton(BUTTON_6, 6);
     registerButton(BUTTON_7, 7);
-    xTaskCreate(loop, "loop", 4096, NULL, 4, NULL);
-    // while (1)
-    // {
-    //     ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-    //     vTaskDelay(2000 / portTICK_PERIOD_MS);
-    // }
+
+    rmt_tx_channel_config_t tx_chan_config = {
+        .gpio_num = GPIO_NUM_48,
+        .clk_src = RMT_CLK_SRC_DEFAULT, // select source clock
+        .resolution_hz = RMT_LED_STRIP_RESOLUTION_HZ,
+        .mem_block_symbols = 64, // increase the block size can make the LED less flickering
+
+        .trans_queue_depth = 4, // set the number of transactions that can be pending in the background
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &led_chan));
+
+    led_strip_encoder_config_t encoder_config = {
+        .resolution = RMT_LED_STRIP_RESOLUTION_HZ,
+    };
+    ESP_ERROR_CHECK(rmt_new_led_strip_encoder(&encoder_config, &led_encoder));
+    ESP_ERROR_CHECK(rmt_enable(led_chan));
+    if (ChargingFlag)
+    {
+        xTaskCreate(chargingLoop, "chargingLoop", 4096, NULL, 4, NULL);
+    }
+    else
+    {
+
+        xTaskCreate(loop, "loop", 4096, NULL, 4, NULL);
+        xTaskCreate(ledLoop, "ledLoop", 4096, NULL, 4, NULL);
+    }
 }
