@@ -1,151 +1,113 @@
-
-#include <string.h>
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-// #include <esp_wifi.h>
-#include "esp_system.h"
-#include "esp_wifi.h"
-#include "esp_pm.h"
-#define LCD_H_RES 128
-#define LCD_V_RES 64
-#define I2C_SDA_GPIO 8
-#define I2C_SCL_GPIO 9
-#define I2C_HOST_ID 0
-#define I2C_DEV_ADDR 0x3C
-#define DISP_BUF_SIZE (128 * 64 / 8)
-#define BUZZER_PIN 47
-#define VIBRATE_PIN 21
-#define BAT_MON_PIN 1
-#define BAT_CHG 17
-#define BAT_STDBY 18
-#define FIRMWARE_VERSION "1.13"
-#define MIN_BATTERY 3.2
-// #include "esp_lcd_panel_io_interface.h"
-#include "pitches.h"
-#include "esp_lcd_types.h"
-#include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_vendor.h"
-#include "esp_lcd_panel_ops.h"
-#include "led_strip_encoder.h"
-#include "driver/rmt_tx.h"
-#define RMT_LED_STRIP_RESOLUTION_HZ 10000000 // 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
-#define LED_RING_PIN 48
-#define LED_NUMBERS 8
-#define CHASE_SPEED_MS 100
-static uint8_t led_strip_pixels[LED_NUMBERS * 3];
-
-#include "driver/i2c.h"
-
-// #include "esp_hw_support.h"
-#include "esp_mac.h"
-
-#include "esp_websocket_client.h"
-#include "esp_event.h"
-#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+/*
+ * SPDX-FileCopyrightText: 2022-2023 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+// #define CONFIG_BRIDGE_SOFTAP_PASSWORD "funclick123!"
+// #define CONFIG_BRIDGE_SOFTAP_SSID "FUNCLICK_MESH"
+#define CONFIG_MESH_LITE_MAX_ROUTER_NUMBER 10
+#define CONFIG_BRIDGE_SOFTAP_MAX_CONNECT_NUMBER 10
+#include <inttypes.h>
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "funclick_logo.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include <string.h>
+#include "esp_wifi.h"
 #include "nvs_flash.h"
-#include "freertos/semphr.h"
-#include "esp_heap_caps.h"
-
-// #include "Arduino.h"
-// #include "libraries/arduinoWebSockets/src/SocketIOclient.h"
-// #include "lwip/err.h"
-// #include "lwip/sys.h"
+#include <sys/socket.h>
+#include "esp_websocket_client.h"
+#include "esp_mac.h"
 #include "Arduino.h"
-
+#include "pitches.h"
 #include <ArduinoJson.h>
-// #include "SocketIOclient.h"
+#include "esp_bridge.h"
+#include "esp_mesh_lite.h"
 #include <esp32-hal-log.h>
 #include "cJSON.h"
 #include <esp_http_client.h>
 #include "iot_button.h"
 #include "Wire.h"
-#define SSD1306_128_64
-
-#include "Adafruit_SSD1306.h"
-#include "Fonts/FreeSerifItalic24pt7b.h"
-#include "funclick_logo.h"
-#include <esp_ota_ops.h>
-#include <esp_http_client.h>
-#include <esp_https_ota.h>
-
-#define WIFI_SSID "FUNCLICK"
-#define WIFI_PASS "funclick123!"
-
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
-static EventGroupHandle_t s_wifi_event_group;
-static const char *TAG = "wifi station";
-static const char *LOOP_TAG = "loop function";
-// SocketIOclient socketIO;
-// String ServerIp = "192.168.0.2";
-static int s_retry_num = 0;
-
-#define NO_DATA_TIMEOUT_SEC 5
-#define POWER_PIN 37
-#define BUTTON_1 15
-#define BUTTON_2 5
-#define BUTTON_3 13
-#define BUTTON_4 4
-#define BUTTON_5 6
-#define BUTTON_6 11
-#define BUTTON_7 16
-#define BUTTON_1_LED 2
-#define BUTTON_2_LED 10
-#define BUTTON_3_LED 14
-#define BUTTON_4_LED 3
-#define BUTTON_5_LED 7
-#define BUTTON_6_LED 12
-#define BUTTONS_LED_R 34
-#define BUTTONS_LED_G 35
-#define BUTTONS_LED_B 36
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
-#define SCL_PIN 9
-#define SDA_PIN 8
+#define PAYLOAD_LEN (1456) /**< Max payload size(in bytes) */
+#define I2C_SDA_GPIO 8
+#define I2C_SCL_GPIO 9
+#define I2C_HOST_ID 0
+#define I2C_DEV_ADDR 0x3C
+#define DISP_BUF_SIZE (128 * 64 / 8)
+#define POWER_PIN 37
+#define BUZZER_PIN 47
+#define VIBRATE_PIN 21
+#define BAT_MON_PIN 1
+#define BAT_CHG 17
+#define BAT_STDBY 18
+#include "Adafruit_SSD1306.h"
+#include "Fonts/FreeSerifItalic24pt7b.h"
 Adafruit_SSD1306 display;
-SemaphoreHandle_t xMutex;
-rmt_channel_handle_t led_chan = NULL;
-rmt_encoder_handle_t led_encoder = NULL;
-rmt_transmit_config_t tx_config = {
-    .loop_count = 0,
-};
-bool ChargingFlag = false;
-int ledStatus = 0;
-int ledValueR = 0;
-int ledValueG = 0;
-int ledValueB = 0;
-int player_number;
-int score;
-int rank;
-int rssi;
-int battery_voltage;
-char *bottomText;
-void printCenter(const char *buf, int y);
-void printStatusBottom(const char *buf);
-void sendMessage(void *pvParameters);
-void sendStatus(void *pvParameters);
-void beepTask(void *pvParameter);
-void led_strip_hsv2rgb(uint32_t h, uint32_t saturation, uint32_t value, uint32_t *r, uint32_t *g, uint32_t *b);
-void safeFree(void **ptr)
+static int g_sockfd = -1;
+static const char *TAG = "local_control";
+static void websocket_app_start(void);
+extern "C"
 {
-    if (ptr != NULL && *ptr != NULL)
-    {
-        free(*ptr);
-        *ptr = NULL; // Set the pointer to NULL after freeing it
-    }
+    void app_main();
 }
-void *safeMalloc(size_t size)
+/**
+ * @brief Create a tcp client
+ */
+// static int socket_tcp_client_create(const char *ip, uint16_t port)
+// {
+//     ESP_LOGD(TAG, "Create a tcp client, ip: %s, port: %d", ip, port);
+
+//     esp_err_t ret = ESP_OK;
+//     int sockfd = -1;
+//     struct ifreq iface;
+//     memset(&iface, 0x0, sizeof(iface));
+//     struct sockaddr_in server_addr = {
+//         .sin_family = AF_INET,
+//         .sin_port = htons(port),
+//         .sin_addr = {.s_addr = inet_addr(ip)},
+//     };
+
+//     sockfd = socket(AF_INET, SOCK_STREAM, 0);
+//     if (sockfd < 0)
+//     {
+//         ESP_LOGE(TAG, "socket create, sockfd: %d", sockfd);
+//         goto ERR_EXIT;
+//     }
+
+//     esp_netif_get_netif_impl_name(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), iface.ifr_name);
+//     if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, &iface, sizeof(struct ifreq)) != 0)
+//     {
+//         ESP_LOGE(TAG, "Bind [sock=%d] to interface %s fail", sockfd, iface.ifr_name);
+//     }
+
+//     ret = connect(sockfd, (struct sockaddr *)&server_addr, sizeof(struct sockaddr_in));
+//     if (ret < 0)
+//     {
+//         ESP_LOGD(TAG, "socket connect, ret: %d, ip: %s, port: %d",
+//                  ret, ip, port);
+//         goto ERR_EXIT;
+//     }
+//     return sockfd;
+
+// ERR_EXIT:
+
+//     if (sockfd != -1)
+//     {
+//         close(sockfd);
+//     }
+
+//     return -1;
+// }
+static void log_error_if_nonzero(const char *message, int error_code)
 {
-    void *ptr = pvPortMalloc(size);
-    if (ptr == NULL)
+    if (error_code != 0)
     {
-        ESP_LOGE(TAG, "Memory allocation failed!");
+        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
     }
-    return ptr;
 }
 void beep(int note, int duration, int delayms)
 {
@@ -157,184 +119,6 @@ void beep(int note, int duration, int delayms)
     tone(BUZZER_PIN, note, duration);
     // ledcWriteTone(BUZZER_PIN, note);
 }
-static void event_handler(void *arg, esp_event_base_t event_base,
-                          int32_t event_id, void *event_data)
-{
-    if (event_base == ESP_HTTPS_OTA_EVENT)
-    {
-        switch (event_id)
-        {
-        case ESP_HTTPS_OTA_START:
-            ESP_LOGI(TAG, "OTA started");
-            printStatusBottom("UPDATE STARTED");
-            break;
-        case ESP_HTTPS_OTA_CONNECTED:
-            ESP_LOGI(TAG, "Connected to server");
-            break;
-        case ESP_HTTPS_OTA_GET_IMG_DESC:
-            ESP_LOGI(TAG, "Reading Image Description");
-            break;
-        case ESP_HTTPS_OTA_VERIFY_CHIP_ID:
-            ESP_LOGI(TAG, "Verifying chip id of new image: %d", *(esp_chip_id_t *)event_data);
-            break;
-        case ESP_HTTPS_OTA_DECRYPT_CB:
-            ESP_LOGI(TAG, "Callback to decrypt function");
-            break;
-        case ESP_HTTPS_OTA_WRITE_FLASH:
-            ESP_LOGD(TAG, "Writing to flash: %d written", *(int *)event_data);
-            break;
-        case ESP_HTTPS_OTA_UPDATE_BOOT_PARTITION:
-            ESP_LOGI(TAG, "Boot partition updated. Next Partition: %d", *(esp_partition_subtype_t *)event_data);
-            break;
-        case ESP_HTTPS_OTA_FINISH:
-            ESP_LOGI(TAG, "OTA finish");
-            break;
-        case ESP_HTTPS_OTA_ABORT:
-            ESP_LOGI(TAG, "OTA abort");
-            printStatusBottom("UPDATE ABORT");
-            break;
-        }
-    }
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
-    {
-        esp_wifi_connect();
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-
-        if (s_retry_num < 100)
-        {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        }
-        else
-        {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            printStatusBottom("NTWRK FAIL SHTDWN");
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
-            ESP_LOGW(TAG, "SHUTDOWN");
-            beep(NOTE_A4, 80, 0);
-            beep(NOTE_A, 80, 100);
-            digitalWrite(POWER_PIN, LOW);
-        }
-        ESP_LOGI(TAG, "connect to the AP fail");
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-void wifi_init_sta(void)
-{
-    s_wifi_event_group = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_netif_init());
-
-    esp_netif_t *m_netif = esp_netif_create_default_wifi_sta();
-    esp_netif_set_hostname(m_netif, "FUNCLICK_CLICKER");
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-            .threshold{
-                .authmode = WIFI_AUTH_WPA2_PSK,
-            }},
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    printStatusBottom("CONNECTING");
-
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE,
-                                           pdFALSE,
-                                           portMAX_DELAY);
-
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
-    if (bits & WIFI_CONNECTED_BIT)
-    {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 WIFI_SSID, WIFI_PASS);
-
-        printStatusBottom("NTWRK CONNECTED");
-    }
-    else if (bits & WIFI_FAIL_BIT)
-    {
-
-        printStatusBottom("W CONNECT FAIL");
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                 WIFI_SSID, WIFI_PASS);
-    }
-    else
-    {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
-    }
-}
-extern "C"
-{
-    void app_main();
-}
-// static TimerHandle_t shutdown_signal_timer;
-// static SemaphoreHandle_t shutdown_sema;
-static void log_error_if_nonzero(const char *message, int error_code)
-{
-    if (error_code != 0)
-    {
-        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
-    }
-}
-
-// static void shutdown_signaler(TimerHandle_t xTimer)
-// {
-//     ESP_LOGI(TAG, "No data received for %d seconds, signaling shutdown", NO_DATA_TIMEOUT_SEC);
-//     xSemaphoreGive(shutdown_sema);
-// }
-void turnOnBtnLeds()
-{
-    digitalWrite(BUTTON_1_LED, HIGH);
-    digitalWrite(BUTTON_2_LED, HIGH);
-    digitalWrite(BUTTON_3_LED, HIGH);
-    digitalWrite(BUTTON_4_LED, HIGH);
-    digitalWrite(BUTTON_5_LED, HIGH);
-    digitalWrite(BUTTON_6_LED, HIGH);
-}
-void turnOffBtnLeds()
-{
-    digitalWrite(BUTTON_1_LED, LOW);
-    digitalWrite(BUTTON_2_LED, LOW);
-    digitalWrite(BUTTON_3_LED, LOW);
-    digitalWrite(BUTTON_4_LED, LOW);
-    digitalWrite(BUTTON_5_LED, LOW);
-    digitalWrite(BUTTON_6_LED, LOW);
-}
-int stopVibrateMills;
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     // heap_caps_print_heap_info("Before websocket_event_handler");
@@ -348,16 +132,16 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         ESP_LOGI(TAG, "WEBSOCKET_EVENT_CONNECTED");
         display.fillRect(0, 52, 128, 12, SSD1306_BLACK);
         display.fillRect(0, 0, 10, 10, SSD1306_BLACK);
-        display.drawBitmap(0, 0, icon_connected, 7, 8, SSD1306_WHITE);
+        // display.drawBitmap(0, 0, icon_connected, 7, 8, SSD1306_WHITE);
         display.display();
 
-        xTaskCreate(sendStatus, "sendStatus", 4096, NULL, 4, NULL);
+        // xTaskCreate(sendStatus, "sendStatus", 4096, NULL, 4, NULL);
     }
     break;
     case WEBSOCKET_EVENT_DISCONNECTED:
     {
-        printStatusBottom("SRVR DSCNCT");
-        ESP_LOGI(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
+        // printStatusBottom("SRVR DSCNCT");
+        // ESP_LOGI(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
         log_error_if_nonzero("HTTP status code", data->error_handle.esp_ws_handshake_status_code);
         if (data->error_handle.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT)
         {
@@ -414,22 +198,22 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                             int value_r = cJSON_GetObjectItem(event_data_object, "value_R")->valueint;
                             int value_g = cJSON_GetObjectItem(event_data_object, "value_G")->valueint;
                             int value_b = cJSON_GetObjectItem(event_data_object, "value_B")->valueint;
-                            ledValueR = value_r;
-                            ledValueG = value_g;
-                            ledValueB = value_b;
-                            ledStatus = 1;
+                            // ledValueR = value_r;
+                            // ledValueG = value_g;
+                            // ledValueB = value_b;
+                            // ledStatus = 1;
                             int value_blink = cJSON_GetObjectItem(event_data_object, "value_blink")->valueint;
                             int value_blink_counter = cJSON_GetObjectItem(event_data_object, "value_blink_counter")->valueint;
                             int value_brightness = cJSON_GetObjectItem(event_data_object, "value_brightness")->valueint;
-                            analogWrite(BUTTONS_LED_R, 255 - value_r);
-                            analogWrite(BUTTONS_LED_G, 255 - value_g);
-                            analogWrite(BUTTONS_LED_B, 255 - value_b);
+                            // analogWrite(BUTTONS_LED_R, 255 - value_r);
+                            // analogWrite(BUTTONS_LED_G, 255 - value_g);
+                            // analogWrite(BUTTONS_LED_B, 255 - value_b);
 
-                            turnOnBtnLeds();
+                            // turnOnBtnLeds();
                         }
                         else
                         {
-                            turnOffBtnLeds();
+                            // turnOffBtnLeds();
                         }
                         // cJSON_free(event_data);
                         // cJSON_free(event_data_object);
@@ -453,7 +237,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                     display.setTextSize(1);
                     char player_number_str[10];
                     snprintf(player_number_str, sizeof(player_number_str), "%d", player_number);
-                    printCenter(player_number_str, 45);
+                    // printCenter(player_number_str, 45);
 
                     display.display();
                     vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -471,12 +255,12 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 {
                     display.fillRect(0, 0, 128, 64, SSD1306_BLACK);
                     display.display();
-                    printCenter("SHUTDOWN", 20);
+                    // printCenter("SHUTDOWN", 20);
                     vTaskDelay(2000 / portTICK_PERIOD_MS);
                     ESP_LOGW(TAG, "SHUTDOWN");
                     beep(NOTE_A4, 80, 0);
                     beep(NOTE_A, 80, 100);
-                    digitalWrite(POWER_PIN, LOW);
+                    // digitalWrite(POWER_PIN, LOW);
 
                     // xTimerReset(shutdown_signal_timer, portMAX_DELAY);
                 }
@@ -485,7 +269,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                     cJSON *event_data_object = cJSON_GetArrayItem(root, 1);
                     int value = cJSON_GetObjectItem(event_data_object, "value")->valueint;
                     digitalWrite(VIBRATE_PIN, HIGH);
-                    stopVibrateMills = millis() + value;
+                    // stopVibrateMills = millis() + value;
                 }
                 else if (std::string(event_name) == "tone")
                 {
@@ -530,16 +314,21 @@ void macToString(const uint8_t *mac, char *str)
     snprintf(str, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
-String uniqueID;
+void webSocketTask(void *pvParameters)
+{
+    websocket_app_start();
+    vTaskDelete(NULL);
+}
 esp_websocket_client_handle_t client;
+// String uniqueID;
 static void websocket_app_start(void)
 {
     uint8_t mac[8];
     esp_efuse_mac_get_default(mac);
     char macStr[18]; // 6 bytes * 2 characters per byte + 5 colons + 1 null terminator
 
-    macToString(mac, macStr);
-    uniqueID = String(macStr);
+    ;
+    //  uniqueID = String(macStr);
     esp_websocket_client_config_t websocket_cfg = {
         // .ping_interval_sec = 2,
         // .ping_interval_sec = 3,
@@ -574,7 +363,7 @@ static void websocket_app_start(void)
     ESP_LOGI(TAG, "Connecting to %s...", websocket_cfg.host);
 
     client = esp_websocket_client_init(&websocket_cfg);
-    esp_websocket_client_append_header(client, "hw_id", uniqueID.c_str());
+    esp_websocket_client_append_header(client, "hw_id", macStr);
     esp_websocket_client_set_ping_interval_sec(client, 2);
 
     // esp_websocket_client_set_headers(client, "hw_id: %s\r\nversion:1.0.1\r\n", uniqueID.c_str());
@@ -608,547 +397,171 @@ static void websocket_app_start(void)
     // ESP_LOGI(TAG, "Websocket Stopped");
     // esp_websocket_client_destroy(client);
 }
-void sendMessage(void *pvParameters)
+
+// void tcp_client_write_task(void *arg)
+// {
+//     size_t size = 0;
+//     int count = 0;
+//     char *data = NULL;
+//     esp_err_t ret = ESP_OK;
+//     uint8_t sta_mac[6] = {0};
+
+//     esp_wifi_get_mac(WIFI_IF_STA, sta_mac);
+
+//     ESP_LOGI(TAG, "TCP client write task is running");
+
+//     while (1)
+//     {
+//         if (g_sockfd == -1)
+//         {
+//             vTaskDelay(500 / portTICK_PERIOD_MS);
+//             g_sockfd = socket_tcp_client_create("192.168.0.2", 3001);
+//             continue;
+//         }
+
+//         vTaskDelay(3000 / portTICK_PERIOD_MS);
+
+//         size = asprintf(&data, "{\"src_addr\": \"" MACSTR "\",\"data\": \"Hello TCP Server!\",\"level\": %d,\"count\": %d}\r\n",
+//                         MAC2STR(sta_mac), esp_mesh_lite_get_level(), count++);
+
+//         ESP_LOGD(TAG, "TCP write, size: %d, data: %s", size, data);
+//         ret = write(g_sockfd, data, size);
+//         free(data);
+
+//         if (ret <= 0)
+//         {
+//             ESP_LOGE(TAG, "<%s> TCP write", strerror(errno));
+//             close(g_sockfd);
+//             g_sockfd = -1;
+//             continue;
+//         }
+//     }
+
+//     ESP_LOGI(TAG, "TCP client write task is exit");
+
+//     close(g_sockfd);
+//     g_sockfd = -1;
+//     if (data)
+//     {
+//         free(data);
+//     }
+//     vTaskDelete(NULL);
+// }
+
+/**
+ * @brief Timed printing system information
+ */
+static void print_system_info_timercb(TimerHandle_t timer)
 {
-    if (esp_websocket_client_is_connected(client))
-    {
+    //     uint8_t primary = 0;
+    //     uint8_t sta_mac[6] = {0};
+    //     wifi_ap_record_t ap_info = {0};
+    //     wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    //     wifi_sta_list_t wifi_sta_list = {0x0};
 
-        char *output = (char *)pvParameters;
+    //     esp_wifi_sta_get_ap_info(&ap_info);
+    //     esp_wifi_get_mac(WIFI_IF_STA, sta_mac);
+    //     esp_wifi_ap_get_sta_list(&wifi_sta_list);
+    //     esp_wifi_get_channel(&primary, &second);
 
-        ESP_LOGI(TAG, "SEND Message %s", output);
-        // esp_websocket_client_send_text(client, output.c_s, strlen(output), portMAX_DELAY);
-        esp_websocket_client_send_text(client, output, strlen(output), portMAX_DELAY);
-        if (xSemaphoreTake(xMutex, portMAX_DELAY))
-        {
-            safeFree((void **)&output);
-            xSemaphoreGive(xMutex);
-        }
-    }
-    vTaskDelete(NULL);
+    //     ESP_LOGI(TAG, "System information, channel: %d, layer: %d, self mac: " MACSTR ", parent bssid: " MACSTR ", parent rssi: %d, free heap: %" PRIu32 "", primary,
+    //              esp_mesh_lite_get_level(), MAC2STR(sta_mac), MAC2STR(ap_info.bssid),
+    //              (ap_info.rssi != 0 ? ap_info.rssi : -120), esp_get_free_heap_size());
+    // #if CONFIG_MESH_LITE_MAXIMUM_NODE_NUMBER
+    //     ESP_LOGI(TAG, "child node number: %d", esp_mesh_lite_get_child_node_number());
+    // #endif /* MESH_LITE_NODE_INFO_REPORT */
+    //     for (int i = 0; i < wifi_sta_list.num; i++)
+    //     {
+    //         ESP_LOGI(TAG, "Child mac: " MACSTR, MAC2STR(wifi_sta_list.sta[i].mac));
+    //     }
 }
-void sendStatus(void *pvParameters)
+
+static void ip_event_sta_got_ip_handler(void *arg, esp_event_base_t event_base,
+                                        int32_t event_id, void *event_data)
 {
-    DynamicJsonDocument doc(1024);
-    JsonArray array = doc.to<JsonArray>();
-    array.add("status");
-    JsonObject param1 = array.createNestedObject();
-    param1["version"] = FIRMWARE_VERSION;
-    param1["free_heap"] = esp_get_free_heap_size();
-    param1["battery"] = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
-    int rssi;
-    esp_wifi_sta_get_rssi(&rssi);
-    param1["rssi"] = rssi;
-    String output;
-    serializeJson(doc, output);
-    doc.clear();
-    char *taskData = (char *)safeMalloc(strlen(output.c_str()) + 1);
-    if (taskData != nullptr)
+    static bool tcp_task = false;
+
+    if (!tcp_task)
     {
-        strcpy(taskData, output.c_str());
-        safeFree((void **)&output);
-        if (xSemaphoreTake(xMutex, portMAX_DELAY))
-        {
-            xTaskCreate(sendMessage, "sendMessage", 4096, taskData, 4, NULL);
-
-            xSemaphoreGive(xMutex);
-        }
-    }
-
-    vTaskDelete(NULL);
-}
-static void button_single_click_cb(void *arg, void *usr_data)
-{
-    ESP_LOGI(TAG, "BUTTON_SINGLE_CLICK %i", (int)usr_data);
-    if (esp_websocket_client_is_connected(client))
-    {
-
-        DynamicJsonDocument doc(1024);
-        JsonArray array = doc.to<JsonArray>();
-        array.add("click");
-        JsonObject param1 = array.createNestedObject();
-        param1["pressed"] = (int)usr_data;
-
-        // param1["voltage"] = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
-        String output;
-        serializeJson(doc, output);
-        doc.clear();
-        // socketIO.sendEVENT(output);
-        // char *taskData = (char *)malloc(strlen(output.c_str()) + 1);
-        char *taskData = (char *)safeMalloc(strlen(output.c_str()) + 1);
-        xTaskCreate(beepTask, "beepTask", 4096, NULL, 4, NULL);
-        if (taskData != nullptr)
-        {
-            strcpy(taskData, output.c_str());
-            safeFree((void **)&output);
-            // char data[50];
-            // sprintf(data, "{'event':'click','data':'click','button':'%i'}", (int)usr_data);
-            if (xSemaphoreTake(xMutex, portMAX_DELAY))
-            {
-                xTaskCreate(sendMessage, "sendMessage", 4096, taskData, 5, NULL);
-                xSemaphoreGive(xMutex);
-            }
-        }
-        //
-        // free(taskData);
-        // safeFree((void**)&taskData);
+        // xTaskCreate(webSocketTask, "webSocketTask", 4 * 1024, NULL, 5, NULL);
+        tcp_task = true;
     }
 }
-void registerButton(int pin, int button)
-{
 
-    button_config_t gpio_btn_cfg = {
-        .type = BUTTON_TYPE_GPIO,
-        .long_press_time = 3000,
-        .short_press_time = 50,
-        .gpio_button_config = {
-            .gpio_num = pin,
-            .active_level = 0,
+static esp_err_t esp_storage_init(void)
+{
+    esp_err_t ret = nvs_flash_init();
+
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        // NVS partition was truncated and needs to be erased
+        // Retry nvs_flash_init
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+
+    return ret;
+}
+
+static void wifi_init(void)
+{
+    // Station
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "FUNCLICK",
+            .password = "funclick123!",
         },
     };
-    button_handle_t gpio_btn = iot_button_create(&gpio_btn_cfg);
-    if (NULL == gpio_btn)
-    {
-        ESP_LOGE(TAG, "Button create failed");
-    }
-    iot_button_register_cb(gpio_btn, BUTTON_SINGLE_CLICK, button_single_click_cb, (int *)button);
+    esp_bridge_wifi_set_config(WIFI_IF_STA, &wifi_config);
+
+    // Softap
+    snprintf((char *)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "%s", CONFIG_BRIDGE_SOFTAP_SSID);
+    strlcpy((char *)wifi_config.ap.password, CONFIG_BRIDGE_SOFTAP_PASSWORD, sizeof(wifi_config.ap.password));
+    esp_bridge_wifi_set_config(WIFI_IF_AP, &wifi_config);
 }
 
-void printStatusBottom(const char *buf)
+void app_wifi_set_softap_info(void)
 {
-    display.fillRect(0, 55, 128, 9, SSD1306_BLACK);
-    display.setFont();
+    char softap_ssid[32];
+    uint8_t softap_mac[6];
+    esp_wifi_get_mac(WIFI_IF_AP, softap_mac);
+    memset(softap_ssid, 0x0, sizeof(softap_ssid));
 
-    printCenter(buf, 55);
-}
-void printCenter(const char *buf, int y)
-{
-    int x = 128;
-    int16_t x1, y1;
-    uint16_t w, h;
-    display.setTextColor(WHITE, BLACK);
-    display.getTextBounds(buf, x, y, &x1, &y1, &w, &h); // calc width of new string
-    display.setCursor(x / 2 - w / 2, y);
-
-    display.print(buf);
-    display.display();
-}
-void webSocketTask(void *pvParameters)
-{
-    websocket_app_start();
-    vTaskDelete(NULL);
-}
-int checkRstButtonsCounter = 0;
-int rssi_counter = 0;
-int status_counter = 0;
-int charging_status_counter = 0;
-
-void screenLoop(void *pvParameters)
-{
-}
-void ledLoop(void *pvParameters)
-{
-    uint32_t red = 0;
-    uint32_t green = 0;
-    uint32_t blue = 0;
-    uint16_t hue = 0;
-    uint16_t start_rgb = 0;
-
-    while (1)
-    {
-        if (ledStatus == 0)
-        {
-            for (int j = 0; j < LED_NUMBERS; j += 1)
-            {
-                hue = j * 45 + start_rgb;
-                led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
-                led_strip_pixels[(j * 3 + 0)] = green;
-                led_strip_pixels[(j * 3 + 1)] = blue;
-                led_strip_pixels[(j * 3 + 2)] = red;
-            }
-        }
-        else if (ledStatus == 1)
-        {
-            for (int j = 0; j < LED_NUMBERS; j += 1)
-            {
-                // hue = j * 45 + start_rgb;
-                // led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
-                led_strip_pixels[(j * 3 + 0)] = ledValueG;
-                led_strip_pixels[(j * 3 + 1)] = ledValueR;
-                led_strip_pixels[(j * 3 + 2)] = ledValueB;
-                ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-                ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-                vTaskDelay(CHASE_SPEED_MS / 5 / portTICK_PERIOD_MS);
-            }
-        }
-
-        ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-        ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-        start_rgb += (360 / LED_NUMBERS);
-        vTaskDelay(CHASE_SPEED_MS / portTICK_PERIOD_MS);
-
-        // memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
-        // ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-        // ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-        // vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS * 10));
-    }
-}
-void chargingLoop(void *pvParameters)
-{
-    int i = 0;
-    while (1)
-    {
-        i++;
-        int bat_chg_value = analogRead(BAT_CHG);
-        int bat_stby_value = analogRead(BAT_STDBY);
-        ESP_LOGI(TAG, "BAT_CHG value %i", bat_chg_value);
-        ESP_LOGI(TAG, "BAT_STDBY value %i", bat_stby_value);
-        if (digitalRead(BUTTON_1) == LOW && digitalRead(BUTTON_3) == LOW && digitalRead(BUTTON_7) == LOW)
-        {
-            // Serial.println("checkRstButtonsCounter " + checkRstButtonsCounter);
-            checkRstButtonsCounter++;
-
-            if (checkRstButtonsCounter > 5)
-            {
-                ESP.restart();
-            }
-        }
-        else
-        {
-            checkRstButtonsCounter = 0;
-        }
-
-        if (!(bat_chg_value < 70 || bat_stby_value < 70))
-        {
-            ESP_LOGI(TAG, "CHARGING STOPED");
-            beep(NOTE_A6, 200, 50);
-            beep(NOTE_G6, 200, 50);
-            beep(NOTE_F6, 200, 0);
-            ChargingFlag = false;
-            printStatusBottom("CHRG STOPPED");
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            battery_voltage = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
-            display.setCursor(0, 55);
-            display.setFont();
-            display.setTextSize(1);
-            display.print(String((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095));
-            display.display();
-            vTaskDelay(3000 / portTICK_PERIOD_MS);
-            digitalWrite(POWER_PIN, LOW);
-        }
-        else
-        {
-
-            if (bat_stby_value > 70 && bat_chg_value < 70)
-            {
-                printStatusBottom("BAT FULL");
-                if (i % 2)
-                {
-                    for (int j = 0; j < LED_NUMBERS; j += 1)
-                    {
-                        led_strip_pixels[(j * 3 + 0)] = 255;
-                        led_strip_pixels[(j * 3 + 1)] = 0;
-                        led_strip_pixels[(j * 3 + 2)] = 0;
-                    }
-                }
-                else
-                {
-                    memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
-                }
-
-                ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
-                ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-            }
-            else
-            {
-                printStatusBottom("CHARGING");
-            }
-        }
-        battery_voltage = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
-        display.setCursor(0, 55);
-        display.setFont();
-        display.setTextSize(1);
-        display.print(String((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095));
-        display.display();
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        if (i > 100)
-        {
-            i = 0;
-        }
-    }
-}
-void loop(void *pvParameters)
-{
-    while (1)
-    {
-
-        rssi_counter++;
-
-        status_counter++;
-
-        charging_status_counter++;
-        if (stopVibrateMills > 0 && stopVibrateMills < millis())
-        {
-            digitalWrite(VIBRATE_PIN, LOW);
-            stopVibrateMills = 0;
-        }
-        if (digitalRead(BUTTON_1) == LOW && digitalRead(BUTTON_3) == LOW && digitalRead(BUTTON_7) == LOW)
-        {
-            // Serial.println("checkRstButtonsCounter " + checkRstButtonsCounter);
-            checkRstButtonsCounter++;
-            if (checkRstButtonsCounter > 20)
-            {
-                digitalWrite(VIBRATE_PIN, HIGH);
-            }
-            if (checkRstButtonsCounter > 25)
-            {
-                ESP.restart();
-            }
-        }
-        else
-        {
-            checkRstButtonsCounter = 0;
-            if (stopVibrateMills == 0)
-            {
-                digitalWrite(VIBRATE_PIN, LOW);
-            }
-        }
-
-        if (rssi_counter > 25)
-        {
-
-            // ESP_LOGI(LOOP_TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-            // heap_caps_print_heap_info(MALLOC_CAP_8BIT);
-            int rssi;
-            esp_wifi_sta_get_rssi(&rssi);
-            // printf("%d\n", ap.rssi);
-            display.setCursor(110, 0);
-            display.setFont();
-            display.print(String(135 + rssi));
-            display.drawLine(127, 0, 127, 45, BLACK);
-            display.drawLine(127, max(0, static_cast<int>(floor(((135 + rssi) / 100) * 45))), 127, 45, WHITE);
-            display.display();
-
-            rssi_counter = 0;
-        }
-
-        if (status_counter > 50)
-        {
-            // TODO: send status
-            if (((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095) < MIN_BATTERY)
-            {
-                beep(NOTE_G5, 200, 0);
-                beep(NOTE_B4, 400, 0);
-                beep(NOTE_G5, 200, 0);
-                beep(NOTE_B4, 400, 0);
-
-                printStatusBottom("LOW BATTERY");
-                status_counter = 20;
-            }
-            else
-            {
-                xTaskCreate(sendStatus, "sendStatus", 4096, NULL, 4, NULL);
-                status_counter = 0;
-            }
-        }
-
-        if (ChargingFlag && charging_status_counter > 20)
-        {
-            int bat_chg_value = analogRead(BAT_CHG);
-            int bat_stby_value = analogRead(BAT_STDBY);
-
-            // DynamicJsonDocument doc(1024);
-            // JsonArray array = doc.to<JsonArray>();
-            // array.add("status");
-            // JsonObject param1 = array.createNestedObject();
-            // param1["version"] = FIRMWARE_VERSION;
-            // param1["battery"] = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
-            // param1["bat_chg_value"] = bat_chg_value;
-            // param1["bat_stby_value"] = bat_stby_value;
-            // String output;
-            // serializeJson(doc, output);
-            //   doc.clear();
-            // char *taskData = (char *)malloc(strlen(output.c_str()) + 1);
-            // strcpy(taskData, output.c_str());
-            //   safeFree((void **)&output);
-            // xTaskCreate(sendMessage, "sendMessage", 4096, taskData, 4, NULL);
-
-            // safeFree((void**)&taskData);
-            // xTaskCreate(sendStatus, "sendStatus", 4096, taskData, 4, NULL);
-            if (!(bat_chg_value < 70 || bat_stby_value < 70))
-            {
-                ESP_LOGI(TAG, "CHARGING STOPED");
-                beep(NOTE_A6, 200, 50);
-                beep(NOTE_G6, 200, 50);
-                beep(NOTE_F6, 200, 0);
-                ChargingFlag = false;
-                printStatusBottom("CHARGING STOPED");
-                vTaskDelay(3000 / portTICK_PERIOD_MS);
-                digitalWrite(POWER_PIN, LOW);
-            }
-
-            charging_status_counter = 0;
-        }
-
-        vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
-}
-
-void beepTask(void *pvParameter)
-{
-    // beep(NOTE_A4, 100, 0);
-    beep(NOTE_E6, 150, 0);
-    vTaskDelete(NULL);
-}
-void ota_task(void *pvParameter)
-{
-    char url[100]; // Ensure this is large enough to hold the final string
-    sprintf(url, "http://192.168.0.2:3000/update?version=%s", FIRMWARE_VERSION);
-    esp_http_client_config_t config = {
-        .url = url,
-        .skip_cert_common_name_check = true,
-
-    };
-
-    esp_https_ota_config_t ota_config = {
-        .http_config = &config,
-    };
-    ESP_LOGI(TAG, "Attempting to download update from %s", config.url);
-    esp_err_t ret = esp_https_ota(&ota_config);
-    if (ret == ESP_OK)
-    {
-        ESP_LOGI(TAG, "OTA Succeed, Rebooting...");
-
-        printStatusBottom("UPDATE SUCCESS");
-        // vTaskDelay(1000 / portTICK_PERIOD_MS);
-        // gpio_num_t gpio_num = GPIO_NUM_37;
-        ESP_ERROR_CHECK(gpio_hold_en(GPIO_NUM_37));
-        esp_restart();
-    }
-    else
-    {
-        ESP_LOGE(TAG, "Firmware upgrade failed");
-    }
-    // while (1)
-    // {
-    //     vTaskDelay(1000 / portTICK_PERIOD_MS);
-    // }
-    vTaskDelete(NULL);
-}
-void led_strip_hsv2rgb(uint32_t h, uint32_t saturation, uint32_t value, uint32_t *r, uint32_t *g, uint32_t *b)
-{
-    uint32_t step = 60;
-    h %= 360; // h -> [0,360]
-    uint32_t rgb_max = value * 2.55f;
-    uint32_t rgb_min = rgb_max * (100 - saturation) / 100.0f;
-
-    uint32_t i = h / step;
-    uint32_t diff = h % step;
-
-    // RGB adjustment amount by hue
-    uint32_t rgb_adj = (rgb_max - rgb_min) * diff / step;
-
-    switch (i)
-    {
-    case 0:
-        *r = rgb_max;
-        *g = rgb_min + rgb_adj;
-        *b = rgb_min;
-        break;
-    case 1:
-        *r = rgb_max - rgb_adj;
-        *g = rgb_max;
-        *b = rgb_min;
-        break;
-    case 2:
-        *r = rgb_min;
-        *g = rgb_max;
-        *b = rgb_min + rgb_adj;
-        break;
-    case 3:
-        *r = rgb_min;
-        *g = rgb_max - rgb_adj;
-        *b = rgb_max;
-        break;
-    case 4:
-        *r = rgb_min + rgb_adj;
-        *g = rgb_min;
-        *b = rgb_max;
-        break;
-    default:
-        *r = rgb_max;
-        *g = rgb_min;
-        *b = rgb_max - rgb_adj;
-        break;
-    }
+#ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
+    snprintf(softap_ssid, sizeof(softap_ssid), "%.25s_%02x%02x%02x", CONFIG_BRIDGE_SOFTAP_SSID, softap_mac[3], softap_mac[4], softap_mac[5]);
+#else
+    snprintf(softap_ssid, sizeof(softap_ssid), "%.32s", CONFIG_BRIDGE_SOFTAP_SSID);
+#endif
+    esp_mesh_lite_set_softap_ssid_to_nvs(softap_ssid);
+    esp_mesh_lite_set_softap_psw_to_nvs(CONFIG_BRIDGE_SOFTAP_PASSWORD);
+    esp_mesh_lite_set_softap_info(softap_ssid, CONFIG_BRIDGE_SOFTAP_PASSWORD);
 }
 
 void app_main()
 {
-    ESP_LOGI(TAG, "app_main %s", FIRMWARE_VERSION);
-    // heap_caps_print_heap_info("Initial");
-
-    xMutex = xSemaphoreCreateMutex();
-
+    /**
+     * @brief Set the log level for serial port printing.
+     */
     initArduino();
-    ESP_ERROR_CHECK(gpio_hold_dis(GPIO_NUM_37));
-
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(esp_event_handler_register(ESP_HTTPS_OTA_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
-    pinMode(BAT_CHG, INPUT);
-    pinMode(BAT_STDBY, INPUT);
-    // pinMode(BUZZER_PIN, OUTPUT);
-    pinMode(BAT_MON_PIN, INPUT_PULLUP);
-    pinMode(BUTTON_1, INPUT_PULLUP);
-    pinMode(BUTTON_2, INPUT_PULLUP);
-    pinMode(BUTTON_3, INPUT_PULLUP);
-    pinMode(BUTTON_4, INPUT_PULLUP);
-    pinMode(BUTTON_5, INPUT_PULLUP);
-    pinMode(BUTTON_6, INPUT_PULLUP);
-    pinMode(BUTTON_7, INPUT_PULLUP);
-    int bat_chg_value = analogRead(BAT_CHG);
-    int bat_stby_value = analogRead(BAT_STDBY);
-    ESP_LOGI(TAG, "BAT_CHG value %i", bat_chg_value);
-    ESP_LOGI(TAG, "BAT_STDBY value %i", bat_stby_value);
-    if ((digitalRead(BUTTON_1) == LOW))
-    {
-        ESP_LOGI(TAG, "BUTTON_1 is pressed");
-    }
-    if ((bat_chg_value < 70 || bat_stby_value < 70) && !(digitalRead(BUTTON_1) == LOW))
-    {
-        ChargingFlag = true;
-        beep(NOTE_F6, 200, 0);
-        beep(NOTE_G6, 100, 50);
-        beep(NOTE_A6, 100, 50);
-        beep(NOTE_G6, 100, 50);
-        ESP_LOGI(TAG, "STAUTS CABLE");
-        if (bat_chg_value > 70)
-        {
-            ESP_LOGI(TAG, "CHARGING");
-        }
-        if (bat_stby_value > 70)
-        {
-            ESP_LOGI(TAG, "BATTERY FULL");
-        }
-    }
-    else
-    {
-        ChargingFlag = false;
-        beep(NOTE_C6, 50, 0);
-        beep(NOTE_C7, 50, 50);
-    }
-    pinMode(VIBRATE_PIN, OUTPUT);
-    digitalWrite(VIBRATE_PIN, HIGH);
-    delay(1 * 1000);
     pinMode(POWER_PIN, OUTPUT);
     digitalWrite(POWER_PIN, HIGH);
-    digitalWrite(VIBRATE_PIN, LOW);
+    esp_log_level_set("*", ESP_LOG_INFO);
+
+    esp_storage_init();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    esp_bridge_create_all_netif();
+
+    wifi_init();
+
+    esp_mesh_lite_config_t mesh_lite_config = ESP_MESH_LITE_DEFAULT_INIT();
+    esp_mesh_lite_init(&mesh_lite_config);
+
+    app_wifi_set_softap_info();
+
+    esp_mesh_lite_start();
 
     display = Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
     display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
@@ -1159,99 +572,12 @@ void app_main()
     display.setCursor(0, 0);
     display.display();
     display.drawBitmap(24, 0, funclick_logo, 80, 50, 1);
-    char ver[100]; // Ensure this is large enough to hold the final string
-    if (ChargingFlag)
-    {
-        printStatusBottom("CHARGING");
-    }
-    else
-    {
-        sprintf(ver, "VER: %s", FIRMWARE_VERSION);
-        printStatusBottom(ver);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-    // pinMode(BUZZER_PIN, OUTPUT);
-    pinMode(VIBRATE_PIN, OUTPUT);
-    pinMode(BUTTONS_LED_R, OUTPUT);
-    pinMode(BUTTONS_LED_G, OUTPUT);
-    pinMode(BUTTONS_LED_B, OUTPUT);
-    analogWrite(255 - BUTTONS_LED_R, 0);
-    analogWrite(255 - BUTTONS_LED_G, 0);
-    analogWrite(255 - BUTTONS_LED_B, 0);
+    /**
+     * @breif Create handler
+     */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_sta_got_ip_handler, NULL, NULL));
 
-    pinMode(BUTTON_1_LED, OUTPUT);
-    pinMode(BUTTON_2_LED, OUTPUT);
-    pinMode(BUTTON_3_LED, OUTPUT);
-    pinMode(BUTTON_4_LED, OUTPUT);
-    pinMode(BUTTON_5_LED, OUTPUT);
-    pinMode(BUTTON_6_LED, OUTPUT);
-
-    if (!ChargingFlag)
-    {
-        wifi_init_sta();
-        analogWrite(BUTTONS_LED_R, 255);
-        analogWrite(BUTTONS_LED_G, 0);
-        analogWrite(BUTTONS_LED_B, 255);
-        digitalWrite(BUTTON_1_LED, HIGH);
-        digitalWrite(BUTTON_2_LED, HIGH);
-        digitalWrite(BUTTON_3_LED, HIGH);
-        digitalWrite(BUTTON_4_LED, HIGH);
-        digitalWrite(BUTTON_5_LED, HIGH);
-        digitalWrite(BUTTON_6_LED, HIGH);
-    }
-
-    ESP_LOGI(TAG, "[APP] Startup..");
-    ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
-    esp_log_level_set("*", ESP_LOG_VERBOSE);
-    esp_log_level_set("websocket_client", ESP_LOG_VERBOSE);
-    esp_log_level_set("transport_ws", ESP_LOG_VERBOSE);
-    esp_log_level_set("trans_tcp", ESP_LOG_VERBOSE);
-    if (!ChargingFlag)
-    {
-        xTaskCreate(&ota_task, "ota_task", 8192, NULL, 1, NULL);
-    }
-    ESP_LOGI(TAG, "webSocketTask start");
-    if (!ChargingFlag)
-    {
-        xTaskCreate(webSocketTask, "webSocketTask", 4096, NULL, 4, NULL);
-    }
-    // websocket_app_start();
-    registerButton(BUTTON_1, 1);
-    registerButton(BUTTON_2, 2);
-    registerButton(BUTTON_3, 3);
-    registerButton(BUTTON_4, 4);
-    registerButton(BUTTON_5, 5);
-    registerButton(BUTTON_6, 6);
-    registerButton(BUTTON_7, 7);
-
-    rmt_tx_channel_config_t tx_chan_config = {
-        .gpio_num = GPIO_NUM_48,
-        .clk_src = RMT_CLK_SRC_DEFAULT, // select source clock
-        .resolution_hz = RMT_LED_STRIP_RESOLUTION_HZ,
-        .mem_block_symbols = 64, // increase the block size can make the LED less flickering
-
-        .trans_queue_depth = 4, // set the number of transactions that can be pending in the background
-    };
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &led_chan));
-
-    led_strip_encoder_config_t encoder_config = {
-        .resolution = RMT_LED_STRIP_RESOLUTION_HZ,
-    };
-    ESP_ERROR_CHECK(rmt_new_led_strip_encoder(&encoder_config, &led_encoder));
-    ESP_ERROR_CHECK(rmt_enable(led_chan));
-    if (ChargingFlag)
-    {
-        // esp_pm_config_t pm_config = {
-        // .max_freq_mhz = 40,
-        // .min_freq_mhz = 40};
-        // ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
-        xTaskCreate(chargingLoop, "chargingLoop", 4096, NULL, 4, NULL);
-    }
-    else
-    {
-
-        xTaskCreate(loop, "loop", 4096, NULL, 4, NULL);
-        xTaskCreate(ledLoop, "ledLoop", 4096, NULL, 4, NULL);
-    }
+    TimerHandle_t timer = xTimerCreate("print_system_info", 10000 / portTICK_PERIOD_MS,
+                                       true, NULL, print_system_info_timercb);
+    xTimerStart(timer, 0);
 }
