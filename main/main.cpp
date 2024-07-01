@@ -7,6 +7,7 @@
 // #include <esp_wifi.h>
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_pm.h"
 #define LCD_H_RES 128
 #define LCD_V_RES 64
 #define I2C_SDA_GPIO 8
@@ -19,7 +20,8 @@
 #define BAT_MON_PIN 1
 #define BAT_CHG 17
 #define BAT_STDBY 18
-#define FIRMWARE_VERSION "1.00"
+#define FIRMWARE_VERSION "1.13"
+#define MIN_BATTERY 3.2
 // #include "esp_lcd_panel_io_interface.h"
 #include "pitches.h"
 #include "esp_lcd_types.h"
@@ -108,11 +110,20 @@ Adafruit_SSD1306 display;
 SemaphoreHandle_t xMutex;
 rmt_channel_handle_t led_chan = NULL;
 rmt_encoder_handle_t led_encoder = NULL;
+rmt_transmit_config_t tx_config = {
+    .loop_count = 0,
+};
 bool ChargingFlag = false;
 int ledStatus = 0;
 int ledValueR = 0;
 int ledValueG = 0;
 int ledValueB = 0;
+int player_number;
+int score;
+int rank;
+int rssi;
+int battery_voltage;
+char *bottomText;
 void printCenter(const char *buf, int y);
 void printStatusBottom(const char *buf);
 void sendMessage(void *pvParameters);
@@ -190,6 +201,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
+
         if (s_retry_num < 100)
         {
             esp_wifi_connect();
@@ -222,8 +234,8 @@ void wifi_init_sta(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
 
-    esp_netif_create_default_wifi_sta();
-
+    esp_netif_t *m_netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(m_netif, "FUNCLICK_CLICKER");
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -322,6 +334,7 @@ void turnOffBtnLeds()
     digitalWrite(BUTTON_5_LED, LOW);
     digitalWrite(BUTTON_6_LED, LOW);
 }
+int stopVibrateMills;
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     // heap_caps_print_heap_info("Before websocket_event_handler");
@@ -334,8 +347,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
         ESP_LOGI(TAG, "WEBSOCKET_EVENT_CONNECTED");
         display.fillRect(0, 52, 128, 12, SSD1306_BLACK);
-
-        display.fillRect(0, 0, 7, 8, SSD1306_BLACK);
+        display.fillRect(0, 0, 10, 10, SSD1306_BLACK);
         display.drawBitmap(0, 0, icon_connected, 7, 8, SSD1306_WHITE);
         display.display();
 
@@ -467,6 +479,21 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                     digitalWrite(POWER_PIN, LOW);
 
                     // xTimerReset(shutdown_signal_timer, portMAX_DELAY);
+                }
+                else if (std::string(event_name) == "vibrate")
+                {
+                    cJSON *event_data_object = cJSON_GetArrayItem(root, 1);
+                    int value = cJSON_GetObjectItem(event_data_object, "value")->valueint;
+                    digitalWrite(VIBRATE_PIN, HIGH);
+                    stopVibrateMills = millis() + value;
+                }
+                else if (std::string(event_name) == "tone")
+                {
+                    cJSON *event_data_object = cJSON_GetArrayItem(root, 1);
+
+                    int duration = cJSON_GetObjectItem(event_data_object, "duration")->valueint;
+                    double value = cJSON_GetObjectItem(event_data_object, "value")->valuedouble;
+                    beep(value, duration, 0);
                 }
                 // cJSON *action = cJSON_GetObjectItem(elem, "action");
                 // cJSON *value = cJSON_GetObjectItem(elem, "value");
@@ -715,6 +742,9 @@ int rssi_counter = 0;
 int status_counter = 0;
 int charging_status_counter = 0;
 
+void screenLoop(void *pvParameters)
+{
+}
 void ledLoop(void *pvParameters)
 {
     uint32_t red = 0;
@@ -722,9 +752,7 @@ void ledLoop(void *pvParameters)
     uint32_t blue = 0;
     uint16_t hue = 0;
     uint16_t start_rgb = 0;
-    rmt_transmit_config_t tx_config = {
-        .loop_count = 0,
-    };
+
     while (1)
     {
         if (ledStatus == 0)
@@ -742,11 +770,14 @@ void ledLoop(void *pvParameters)
         {
             for (int j = 0; j < LED_NUMBERS; j += 1)
             {
-                hue = j * 45 + start_rgb;
+                // hue = j * 45 + start_rgb;
                 // led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
                 led_strip_pixels[(j * 3 + 0)] = ledValueG;
                 led_strip_pixels[(j * 3 + 1)] = ledValueR;
                 led_strip_pixels[(j * 3 + 2)] = ledValueB;
+                ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
+                ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+                vTaskDelay(CHASE_SPEED_MS / 5 / portTICK_PERIOD_MS);
             }
         }
 
@@ -763,10 +794,29 @@ void ledLoop(void *pvParameters)
 }
 void chargingLoop(void *pvParameters)
 {
+    int i = 0;
     while (1)
     {
+        i++;
         int bat_chg_value = analogRead(BAT_CHG);
         int bat_stby_value = analogRead(BAT_STDBY);
+        ESP_LOGI(TAG, "BAT_CHG value %i", bat_chg_value);
+        ESP_LOGI(TAG, "BAT_STDBY value %i", bat_stby_value);
+        if (digitalRead(BUTTON_1) == LOW && digitalRead(BUTTON_3) == LOW && digitalRead(BUTTON_7) == LOW)
+        {
+            // Serial.println("checkRstButtonsCounter " + checkRstButtonsCounter);
+            checkRstButtonsCounter++;
+
+            if (checkRstButtonsCounter > 5)
+            {
+                ESP.restart();
+            }
+        }
+        else
+        {
+            checkRstButtonsCounter = 0;
+        }
+
         if (!(bat_chg_value < 70 || bat_stby_value < 70))
         {
             ESP_LOGI(TAG, "CHARGING STOPED");
@@ -774,12 +824,56 @@ void chargingLoop(void *pvParameters)
             beep(NOTE_G6, 200, 50);
             beep(NOTE_F6, 200, 0);
             ChargingFlag = false;
-            printStatusBottom("CHARGING STOPED");
+            printStatusBottom("CHRG STOPPED");
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            battery_voltage = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
+            display.setCursor(0, 55);
+            display.setFont();
+            display.setTextSize(1);
+            display.print(String((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095));
+            display.display();
             vTaskDelay(3000 / portTICK_PERIOD_MS);
             digitalWrite(POWER_PIN, LOW);
         }
+        else
+        {
 
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+            if (bat_stby_value > 70 && bat_chg_value < 70)
+            {
+                printStatusBottom("BAT FULL");
+                if (i % 2)
+                {
+                    for (int j = 0; j < LED_NUMBERS; j += 1)
+                    {
+                        led_strip_pixels[(j * 3 + 0)] = 255;
+                        led_strip_pixels[(j * 3 + 1)] = 0;
+                        led_strip_pixels[(j * 3 + 2)] = 0;
+                    }
+                }
+                else
+                {
+                    memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
+                }
+
+                ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
+                ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+            }
+            else
+            {
+                printStatusBottom("CHARGING");
+            }
+        }
+        battery_voltage = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
+        display.setCursor(0, 55);
+        display.setFont();
+        display.setTextSize(1);
+        display.print(String((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095));
+        display.display();
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        if (i > 100)
+        {
+            i = 0;
+        }
     }
 }
 void loop(void *pvParameters)
@@ -792,6 +886,11 @@ void loop(void *pvParameters)
         status_counter++;
 
         charging_status_counter++;
+        if (stopVibrateMills > 0 && stopVibrateMills < millis())
+        {
+            digitalWrite(VIBRATE_PIN, LOW);
+            stopVibrateMills = 0;
+        }
         if (digitalRead(BUTTON_1) == LOW && digitalRead(BUTTON_3) == LOW && digitalRead(BUTTON_7) == LOW)
         {
             // Serial.println("checkRstButtonsCounter " + checkRstButtonsCounter);
@@ -808,7 +907,10 @@ void loop(void *pvParameters)
         else
         {
             checkRstButtonsCounter = 0;
-            digitalWrite(VIBRATE_PIN, LOW);
+            if (stopVibrateMills == 0)
+            {
+                digitalWrite(VIBRATE_PIN, LOW);
+            }
         }
 
         if (rssi_counter > 25)
@@ -832,8 +934,21 @@ void loop(void *pvParameters)
         if (status_counter > 50)
         {
             // TODO: send status
-            xTaskCreate(sendStatus, "sendStatus", 4096, NULL, 4, NULL);
-            status_counter = 0;
+            if (((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095) < MIN_BATTERY)
+            {
+                beep(NOTE_G5, 200, 0);
+                beep(NOTE_B4, 400, 0);
+                beep(NOTE_G5, 200, 0);
+                beep(NOTE_B4, 400, 0);
+
+                printStatusBottom("LOW BATTERY");
+                status_counter = 20;
+            }
+            else
+            {
+                xTaskCreate(sendStatus, "sendStatus", 4096, NULL, 4, NULL);
+                status_counter = 0;
+            }
         }
 
         if (ChargingFlag && charging_status_counter > 20)
@@ -1009,8 +1124,9 @@ void app_main()
     {
         ChargingFlag = true;
         beep(NOTE_F6, 200, 0);
-        beep(NOTE_G6, 200, 50);
-        beep(NOTE_A6, 200, 50);
+        beep(NOTE_G6, 100, 50);
+        beep(NOTE_A6, 100, 50);
+        beep(NOTE_G6, 100, 50);
         ESP_LOGI(TAG, "STAUTS CABLE");
         if (bat_chg_value > 70)
         {
@@ -1069,15 +1185,19 @@ void app_main()
     pinMode(BUTTON_4_LED, OUTPUT);
     pinMode(BUTTON_5_LED, OUTPUT);
     pinMode(BUTTON_6_LED, OUTPUT);
-    digitalWrite(BUTTON_1_LED, HIGH);
-    digitalWrite(BUTTON_2_LED, HIGH);
-    digitalWrite(BUTTON_3_LED, HIGH);
-    digitalWrite(BUTTON_4_LED, HIGH);
-    digitalWrite(BUTTON_5_LED, HIGH);
-    digitalWrite(BUTTON_6_LED, HIGH);
+
     if (!ChargingFlag)
     {
         wifi_init_sta();
+        analogWrite(BUTTONS_LED_R, 255);
+        analogWrite(BUTTONS_LED_G, 0);
+        analogWrite(BUTTONS_LED_B, 255);
+        digitalWrite(BUTTON_1_LED, HIGH);
+        digitalWrite(BUTTON_2_LED, HIGH);
+        digitalWrite(BUTTON_3_LED, HIGH);
+        digitalWrite(BUTTON_4_LED, HIGH);
+        digitalWrite(BUTTON_5_LED, HIGH);
+        digitalWrite(BUTTON_6_LED, HIGH);
     }
 
     ESP_LOGI(TAG, "[APP] Startup..");
@@ -1122,6 +1242,10 @@ void app_main()
     ESP_ERROR_CHECK(rmt_enable(led_chan));
     if (ChargingFlag)
     {
+        // esp_pm_config_t pm_config = {
+        // .max_freq_mhz = 40,
+        // .min_freq_mhz = 40};
+        // ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
         xTaskCreate(chargingLoop, "chargingLoop", 4096, NULL, 4, NULL);
     }
     else
