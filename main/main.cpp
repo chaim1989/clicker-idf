@@ -20,7 +20,7 @@
 #define BAT_MON_PIN 1
 #define BAT_CHG 17
 #define BAT_STDBY 18
-#define FIRMWARE_VERSION "1.13"
+#define FIRMWARE_VERSION "1.22"
 #define MIN_BATTERY 3.2
 // #include "esp_lcd_panel_io_interface.h"
 #include "pitches.h"
@@ -30,6 +30,9 @@
 #include "esp_lcd_panel_ops.h"
 #include "led_strip_encoder.h"
 #include "driver/rmt_tx.h"
+#include "mdns.h"
+// #include "mdns_private.h"
+
 #define RMT_LED_STRIP_RESOLUTION_HZ 10000000 // 10MHz resolution, 1 tick = 0.1us (led strip needs a high resolution)
 #define LED_RING_PIN 48
 #define LED_NUMBERS 8
@@ -40,7 +43,14 @@ static uint8_t led_strip_pixels[LED_NUMBERS * 3];
 
 // #include "esp_hw_support.h"
 #include "esp_mac.h"
+typedef enum
+{
+    LED_OFF = 0,
+    LED_ANIM = 1,
+    LED_COLOR = 2,
+    LED_BLINK = 3
 
+} led_modes;
 #include "esp_websocket_client.h"
 #include "esp_event.h"
 #define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
@@ -70,6 +80,7 @@ static uint8_t led_strip_pixels[LED_NUMBERS * 3];
 #include <esp_ota_ops.h>
 #include <esp_http_client.h>
 #include <esp_https_ota.h>
+// #include "../managed_components/espressif__mdns/private_include/mdns_private.h"
 
 #define WIFI_SSID "FUNCLICK"
 #define WIFI_PASS "funclick123!"
@@ -78,9 +89,11 @@ static uint8_t led_strip_pixels[LED_NUMBERS * 3];
 #define WIFI_FAIL_BIT BIT1
 static EventGroupHandle_t s_wifi_event_group;
 static const char *TAG = "wifi station";
+static const char *MDNS_TAG = "mdns";
 static const char *LOOP_TAG = "loop function";
 // SocketIOclient socketIO;
-// String ServerIp = "192.168.0.2";
+static char SocketServerIp[16];
+
 static int s_retry_num = 0;
 
 #define NO_DATA_TIMEOUT_SEC 5
@@ -114,10 +127,13 @@ rmt_transmit_config_t tx_config = {
     .loop_count = 0,
 };
 bool ChargingFlag = false;
-int ledStatus = 0;
+int ledStatus = LED_ANIM;
 int ledValueR = 0;
 int ledValueG = 0;
 int ledValueB = 0;
+int ledValueBlinkRate = 0;
+int ledValueBlinkCounter = 0;
+int ledValueBrightness = 0;
 int player_number;
 int score;
 int rank;
@@ -129,6 +145,9 @@ void printStatusBottom(const char *buf);
 void sendMessage(void *pvParameters);
 void sendStatus(void *pvParameters);
 void beepTask(void *pvParameter);
+void webSocketTask(void *pvParameters);
+void ota_task(void *pvParameter);
+void find_mdns_service(const char *service_name, const char *proto);
 void led_strip_hsv2rgb(uint32_t h, uint32_t saturation, uint32_t value, uint32_t *r, uint32_t *g, uint32_t *b);
 void safeFree(void **ptr)
 {
@@ -335,6 +354,7 @@ void turnOffBtnLeds()
     digitalWrite(BUTTON_6_LED, LOW);
 }
 int stopVibrateMills;
+int checkBatteryMillis;
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     // heap_caps_print_heap_info("Before websocket_event_handler");
@@ -417,10 +437,24 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                             ledValueR = value_r;
                             ledValueG = value_g;
                             ledValueB = value_b;
-                            ledStatus = 1;
+
                             int value_blink = cJSON_GetObjectItem(event_data_object, "value_blink")->valueint;
+                            if (value_blink == 1)
+                            {
+                                ledStatus = LED_BLINK;
+                            }
+                            else
+                            {
+                                ledStatus = LED_COLOR;
+                            }
+                            // ledStatus = LED_COLOR;
+                            int value_blink_rate = cJSON_GetObjectItem(event_data_object, "value_blink_rate")->valueint;
                             int value_blink_counter = cJSON_GetObjectItem(event_data_object, "value_blink_counter")->valueint;
                             int value_brightness = cJSON_GetObjectItem(event_data_object, "value_brightness")->valueint;
+                            ledValueBlinkRate = value_blink_rate;
+                            ledValueBlinkCounter = value_blink_counter;
+                            ledValueBrightness = value_brightness;
+
                             analogWrite(BUTTONS_LED_R, 255 - value_r);
                             analogWrite(BUTTONS_LED_G, 255 - value_g);
                             analogWrite(BUTTONS_LED_B, 255 - value_b);
@@ -429,7 +463,15 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                         }
                         else
                         {
+                            ledStatus = LED_OFF;
                             turnOffBtnLeds();
+                        }
+                        if (((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095) < MIN_BATTERY)
+                        {
+                            analogWrite(BUTTONS_LED_R, 255 - 255);
+                            analogWrite(BUTTONS_LED_G, 255 - 0);
+                            analogWrite(BUTTONS_LED_B, 255 - 0);
+                            turnOnBtnLeds();
                         }
                         // cJSON_free(event_data);
                         // cJSON_free(event_data_object);
@@ -437,38 +479,87 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 }
                 else if (std::string(event_name) == "player_info")
                 {
-                    ESP_LOGW(TAG, "processing player_info event");
-                    cJSON *event_data_object = cJSON_GetArrayItem(root, 1);
-                    int player_number = cJSON_GetObjectItem(event_data_object, "number")->valueint;
-                    int rank = cJSON_GetObjectItem(event_data_object, "rank")->valueint;
-                    int score = cJSON_GetObjectItem(event_data_object, "score")->valueint;
-                    // ESP_LOGI(TAG, "PLAYER NUMBER %i", player_number);
-                    // ESP_LOGI(TAG, "PLAYER RANK %i", rank);
-                    // ESP_LOGI(TAG, "PLAYER SCORE %i", score);
-                    display.fillRect(24, 0, 80, 50, SSD1306_BLACK);
-                    display.display();
-                    // vTaskDelay(100 / portTICK_PERIOD_MS);
-                    // beep(NOTE_A4, 100, 0);
-                    display.setFont(&FreeSerifItalic24pt7b);
-                    display.setTextSize(1);
-                    char player_number_str[10];
-                    snprintf(player_number_str, sizeof(player_number_str), "%d", player_number);
-                    printCenter(player_number_str, 45);
+                    if (!(checkBatteryMillis > 0))
+                    {
+                        ESP_LOGW(TAG, "processing player_info event");
+                        cJSON *event_data_object = cJSON_GetArrayItem(root, 1);
 
-                    display.display();
-                    vTaskDelay(10 / portTICK_PERIOD_MS);
-                    display.fillRect(0, 50, 128, 14, SSD1306_BLACK);
-                    display.drawLine(0, 50, 128, 50, WHITE);
-                    display.drawLine(63, 50, 63, 64, WHITE);
-                    display.setFont();
-                    display.setCursor(2, 55);
-                    display.print("RANK:" + String(rank));
-                    display.setCursor(66, 55);
-                    display.print("SCORE:" + String(score));
-                    display.display();
+                        cJSON *player_number_obj = cJSON_GetObjectItem(event_data_object, "number");
+
+                        cJSON *rank_obj = cJSON_GetObjectItem(event_data_object, "rank");
+                        cJSON *score_obj = cJSON_GetObjectItem(event_data_object, "score");
+                        int player_number = 0;
+                        if (player_number_obj != NULL)
+                        {
+                            player_number = player_number_obj->valueint;
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG, "player_number_obj is null");
+                        }
+                        int rank = 0; //= cJSON_GetObjectItem(event_data_object, "rank")->valueint;
+                        if (rank_obj != NULL)
+                        {
+                            rank = rank_obj->valueint;
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG, "rank_obj is null");
+                        }
+                        int score = 0; //= cJSON_GetObjectItem(event_data_object, "rank")->valueint;
+                        if (score_obj != NULL)
+                        {
+                            score = score_obj->valueint;
+                        }
+                        else
+                        {
+                            ESP_LOGW(TAG, "score_obj is null");
+                        }
+                        // ESP_LOGI(TAG, "PLAYER NUMBER %i", player_number);
+                        // ESP_LOGI(TAG, "PLAYER RANK %i", rank);
+                        // ESP_LOGI(TAG, "PLAYER SCORE %i", score);
+
+                        if (player_number > 0)
+                        {
+                            display.fillRect(24, 0, 80, 50, SSD1306_BLACK);
+                            display.display();
+                            // vTaskDelay(100 / portTICK_PERIOD_MS);
+                            // beep(NOTE_A4, 100, 0);
+                            display.setFont(&FreeSerifItalic24pt7b);
+                            display.setTextSize(1);
+                            ESP_LOGW(TAG, "player_number %d", player_number);
+                            char player_number_str[11];
+                            snprintf(player_number_str, sizeof(player_number_str), "%d", player_number);
+                            ESP_LOGW(TAG, "player_number_str %s", player_number_str);
+                            printCenter(player_number_str, 45);
+                            display.display();
+                            vTaskDelay(10 / portTICK_PERIOD_MS);
+                        }
+
+                        display.fillRect(0, 50, 128, 14, SSD1306_BLACK);
+                        display.drawLine(0, 50, 128, 50, WHITE);
+                        display.drawLine(63, 50, 63, 64, WHITE);
+                        display.setFont();
+                        if (rank > 0)
+                        {
+                            display.setCursor(2, 55);
+                            display.print("RANK:" + String(rank));
+                        }
+                        if (score > 0)
+                        {
+                            display.setCursor(66, 55);
+                            display.print("SCORE:" + String(score));
+                        }
+                        if (score > 0 || rank > 0)
+                        {
+                            display.display();
+                        }
+                    }
                 }
                 else if (String(event_name) == "shutdown")
                 {
+                    cJSON *event_data_object = cJSON_GetArrayItem(root, 1);
+                    int shutdown_in = cJSON_GetObjectItem(event_data_object, "value")->valueint;
                     display.fillRect(0, 0, 128, 64, SSD1306_BLACK);
                     display.display();
                     printCenter("SHUTDOWN", 20);
@@ -486,6 +577,14 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                     int value = cJSON_GetObjectItem(event_data_object, "value")->valueint;
                     digitalWrite(VIBRATE_PIN, HIGH);
                     stopVibrateMills = millis() + value;
+                }
+                else if (std::string(event_name) == "check_battery")
+                {
+                    cJSON *event_data_object = cJSON_GetArrayItem(root, 1);
+                    int value = cJSON_GetObjectItem(event_data_object, "value")->valueint;
+
+                    checkBatteryMillis = millis() + (value * 1000);
+                    // ESP_LOGI(TAG, "checkBatteryMillis %i", checkBatteryMillis);
                 }
                 else if (std::string(event_name) == "tone")
                 {
@@ -559,9 +658,9 @@ static void websocket_app_start(void)
     websocket_cfg.transport = WEBSOCKET_TRANSPORT_OVER_TCP;
     //   websocket_cfg.uri = "ws://192.168.0.2";
     ESP_LOGI(TAG, "websocket_cfg set transport");
-    websocket_cfg.host = "192.168.0.2";
+    websocket_cfg.host = SocketServerIp;
     // websocket_cfg.host = "192.168.1.193";
-    ESP_LOGI(TAG, "websocket_cfg set host");
+    ESP_LOGI(TAG, "websocket_cfg set host %s", websocket_cfg.host);
 
     websocket_cfg.port = 3001;
     ESP_LOGI(TAG, "websocket_cfg set port");
@@ -610,50 +709,53 @@ static void websocket_app_start(void)
 }
 void sendMessage(void *pvParameters)
 {
+    char *output = (char *)pvParameters;
     if (esp_websocket_client_is_connected(client))
     {
-
-        char *output = (char *)pvParameters;
 
         ESP_LOGI(TAG, "SEND Message %s", output);
         // esp_websocket_client_send_text(client, output.c_s, strlen(output), portMAX_DELAY);
         esp_websocket_client_send_text(client, output, strlen(output), portMAX_DELAY);
-        if (xSemaphoreTake(xMutex, portMAX_DELAY))
-        {
-            safeFree((void **)&output);
-            xSemaphoreGive(xMutex);
-        }
+    }
+    if (xSemaphoreTake(xMutex, portMAX_DELAY))
+    {
+        safeFree((void **)&output);
+        xSemaphoreGive(xMutex);
     }
     vTaskDelete(NULL);
 }
 void sendStatus(void *pvParameters)
 {
-    DynamicJsonDocument doc(1024);
-    JsonArray array = doc.to<JsonArray>();
-    array.add("status");
-    JsonObject param1 = array.createNestedObject();
-    param1["version"] = FIRMWARE_VERSION;
-    param1["free_heap"] = esp_get_free_heap_size();
-    param1["battery"] = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
-    int rssi;
-    esp_wifi_sta_get_rssi(&rssi);
-    param1["rssi"] = rssi;
-    String output;
-    serializeJson(doc, output);
-    doc.clear();
-    char *taskData = (char *)safeMalloc(strlen(output.c_str()) + 1);
-    if (taskData != nullptr)
-    {
-        strcpy(taskData, output.c_str());
-        safeFree((void **)&output);
-        if (xSemaphoreTake(xMutex, portMAX_DELAY))
-        {
-            xTaskCreate(sendMessage, "sendMessage", 4096, taskData, 4, NULL);
 
-            xSemaphoreGive(xMutex);
+    if (esp_websocket_client_is_connected(client))
+    {
+        ESP_LOGI(TAG, "Sending Status sendStatus");
+        DynamicJsonDocument doc(1024);
+        JsonArray array = doc.to<JsonArray>();
+        array.add("status");
+        JsonObject param1 = array.createNestedObject();
+        param1["version"] = FIRMWARE_VERSION;
+        param1["free_heap"] = esp_get_free_heap_size();
+        param1["battery"] = ((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095);
+        int rssi;
+        esp_wifi_sta_get_rssi(&rssi);
+        param1["rssi"] = rssi;
+        String output;
+        serializeJson(doc, output);
+        doc.clear();
+        char *taskData = (char *)safeMalloc(strlen(output.c_str()) + 1);
+        if (taskData != nullptr)
+        {
+            strcpy(taskData, output.c_str());
+            safeFree((void **)&output);
+            if (xSemaphoreTake(xMutex, portMAX_DELAY))
+            {
+                xTaskCreate(sendMessage, "sendMessage", 4096, taskData, 4, NULL);
+
+                xSemaphoreGive(xMutex);
+            }
         }
     }
-
     vTaskDelete(NULL);
 }
 static void button_single_click_cb(void *arg, void *usr_data)
@@ -752,26 +854,38 @@ void ledLoop(void *pvParameters)
     uint32_t blue = 0;
     uint16_t hue = 0;
     uint16_t start_rgb = 0;
-
+    bool blinkToggle = false;
+    int lastBlinkToggleMillis =0;
+    int blinkCounter = 0;
     while (1)
     {
-        if (ledStatus == 0)
+        ESP_LOGI(TAG, "ledStatus %i", ledStatus);
+        if (ledStatus == LED_OFF)
         {
+            memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
+            ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
+            ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
+        else if (ledStatus == LED_ANIM)
+        {
+
             for (int j = 0; j < LED_NUMBERS; j += 1)
             {
-                hue = j * 45 + start_rgb;
+                hue = j * 360 / LED_NUMBERS / 2 + start_rgb;
                 led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
                 led_strip_pixels[(j * 3 + 0)] = green;
                 led_strip_pixels[(j * 3 + 1)] = blue;
                 led_strip_pixels[(j * 3 + 2)] = red;
             }
+            start_rgb += (360 / LED_NUMBERS / 2);
         }
-        else if (ledStatus == 1)
+        else if (ledStatus == LED_COLOR)
         {
+
             for (int j = 0; j < LED_NUMBERS; j += 1)
             {
-                // hue = j * 45 + start_rgb;
-                // led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
                 led_strip_pixels[(j * 3 + 0)] = ledValueG;
                 led_strip_pixels[(j * 3 + 1)] = ledValueR;
                 led_strip_pixels[(j * 3 + 2)] = ledValueB;
@@ -780,11 +894,44 @@ void ledLoop(void *pvParameters)
                 vTaskDelay(CHASE_SPEED_MS / 5 / portTICK_PERIOD_MS);
             }
         }
+        else if (ledStatus == LED_BLINK)
+        {
+
+            if ( lastBlinkToggleMillis < millis())
+            {
+                lastBlinkToggleMillis = millis() + ledValueBlinkRate;
+                blinkToggle = !blinkToggle;
+                if (ledValueBlinkCounter > 0 && blinkToggle)
+                {
+                    blinkCounter++;
+                }
+            }
+
+            if (!blinkToggle)
+            {
+                memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
+            }
+            else
+            {
+
+                for (int j = 0; j < LED_NUMBERS; j += 1)
+                {
+                    led_strip_pixels[(j * 3 + 0)] = ledValueG;
+                    led_strip_pixels[(j * 3 + 1)] = ledValueR;
+                    led_strip_pixels[(j * 3 + 2)] = ledValueB;
+                }
+            }
+            ESP_LOGI(TAG, "blinkToggle %s", blinkToggle ? "true" : "false");
+            if (ledValueBlinkCounter>0 && blinkCounter > ledValueBlinkCounter)
+            {
+                ledStatus = LED_COLOR;
+                blinkCounter = 0;
+            }
+        }
 
         ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
         ESP_ERROR_CHECK(rmt_tx_wait_all_done(led_chan, portMAX_DELAY));
-        start_rgb += (360 / LED_NUMBERS);
-        vTaskDelay(CHASE_SPEED_MS / portTICK_PERIOD_MS);
+        vTaskDelay((ledStatus == LED_BLINK && ledValueBlinkRate < CHASE_SPEED_MS ? ledValueBlinkRate : CHASE_SPEED_MS) / portTICK_PERIOD_MS);
 
         // memset(led_strip_pixels, 0, sizeof(led_strip_pixels));
         // ESP_ERROR_CHECK(rmt_transmit(led_chan, led_encoder, led_strip_pixels, sizeof(led_strip_pixels), &tx_config));
@@ -805,16 +952,16 @@ void chargingLoop(void *pvParameters)
         if (digitalRead(BUTTON_1) == LOW && digitalRead(BUTTON_3) == LOW && digitalRead(BUTTON_7) == LOW)
         {
             // Serial.println("checkRstButtonsCounter " + checkRstButtonsCounter);
-            checkRstButtonsCounter++;
+            // checkRstButtonsCounter++;
 
-            if (checkRstButtonsCounter > 5)
-            {
-                ESP.restart();
-            }
+            // if (checkRstButtonsCounter > 1)
+            // {
+            ESP.restart();
+            // }
         }
         else
         {
-            checkRstButtonsCounter = 0;
+            // checkRstButtonsCounter = 0;
         }
 
         if (!(bat_chg_value < 70 || bat_stby_value < 70))
@@ -886,7 +1033,66 @@ void loop(void *pvParameters)
         status_counter++;
 
         charging_status_counter++;
-        if (stopVibrateMills > 0 && stopVibrateMills < millis())
+        if (checkBatteryMillis > 0 && checkBatteryMillis > millis())
+        {
+            double bv = (analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095;
+
+            // battery_voltage = ();
+            display.fillRect(0, 0, 128, 64, SSD1306_BLACK);
+            display.setCursor(40, 8);
+            display.setFont();
+            display.setTextSize(2);
+            display.print(String(bv));
+            display.display();
+            ESP_LOGI(TAG, "Battery Voltage %f", bv);
+            if (bv > 4.1)
+            {
+                ledStatus = LED_COLOR;
+                ledValueG = 255;
+                ledValueB = 0;
+                ledValueR = 0;
+            }
+            else if (bv > 3.9)
+            {
+                ledStatus = LED_COLOR;
+                ledValueG = 150;
+                ledValueB = 50;
+                ledValueR = 0;
+            }
+            else if (bv > 3.4)
+            {
+                ledStatus = LED_COLOR;
+                ledValueG = 10;
+                ledValueB = 10;
+                ledValueR = 100;
+            }
+            else
+            {
+                ledStatus = LED_COLOR;
+                ledValueG = 0;
+                ledValueB = 0;
+                ledValueR = 255;
+            }
+            analogWrite(BUTTONS_LED_R, 255 - ledValueR);
+            analogWrite(BUTTONS_LED_G, 255 - ledValueG);
+            analogWrite(BUTTONS_LED_B, 255 - ledValueB);
+            turnOnBtnLeds();
+        }
+        else
+        {
+            if (checkBatteryMillis > 0)
+            {
+                // CHANGE status to led off if battery check time is over
+                ledStatus = LED_OFF;
+                display.fillRect(0, 0, 128, 64, SSD1306_BLACK);
+                display.setTextSize(1);
+                display.display();
+                turnOffBtnLeds();
+            }
+
+            checkBatteryMillis = 0;
+        }
+        if (checkBatteryMillis > 0 || (stopVibrateMills > 0 && stopVibrateMills < millis()))
         {
             digitalWrite(VIBRATE_PIN, LOW);
             stopVibrateMills = 0;
@@ -907,16 +1113,16 @@ void loop(void *pvParameters)
         else
         {
             checkRstButtonsCounter = 0;
-            if (stopVibrateMills == 0)
+            if (checkBatteryMillis > 0 || stopVibrateMills == 0)
             {
                 digitalWrite(VIBRATE_PIN, LOW);
             }
         }
 
-        if (rssi_counter > 25)
+        if (!(checkBatteryMillis > 0) && rssi_counter > 25)
         {
-
-            // ESP_LOGI(LOOP_TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
+            ESP_LOGI(LOOP_TAG, "rssi counter");
+            ESP_LOGI(LOOP_TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
             // heap_caps_print_heap_info(MALLOC_CAP_8BIT);
             int rssi;
             esp_wifi_sta_get_rssi(&rssi);
@@ -931,8 +1137,9 @@ void loop(void *pvParameters)
             rssi_counter = 0;
         }
 
-        if (status_counter > 50)
+        if (!(checkBatteryMillis > 0) && status_counter > 50)
         {
+            ESP_LOGI(LOOP_TAG, "status_counter");
             // TODO: send status
             if (((analogRead(BAT_MON_PIN) * 2 * 3.7) / 4095) < MIN_BATTERY)
             {
@@ -940,7 +1147,10 @@ void loop(void *pvParameters)
                 beep(NOTE_B4, 400, 0);
                 beep(NOTE_G5, 200, 0);
                 beep(NOTE_B4, 400, 0);
-
+                analogWrite(BUTTONS_LED_R, 255 - 255);
+                analogWrite(BUTTONS_LED_G, 255 - 0);
+                analogWrite(BUTTONS_LED_B, 255 - 0);
+                turnOnBtnLeds();
                 printStatusBottom("LOW BATTERY");
                 status_counter = 20;
             }
@@ -1081,7 +1291,137 @@ void led_strip_hsv2rgb(uint32_t h, uint32_t saturation, uint32_t value, uint32_t
         break;
     }
 }
+// static const char *if_str[] = {"STA", "AP", "ETH", "MAX"};
+static const char *ip_protocol_str[] = {"V4", "V6", "MAX"};
+void mdns_print_results(mdns_result_t *results)
+{
+    mdns_result_t *r = results;
+    mdns_ip_addr_t *a = NULL;
+    int i = 1, t;
+    while (r)
+    {
+        printf("%d: Type: %s\n", i++, ip_protocol_str[r->ip_protocol]);
+        if (r->instance_name)
+        {
+            ESP_LOGW(MDNS_TAG, "  PTR : %s\n", r->instance_name);
+        }
+        if (r->hostname)
+        {
+            ESP_LOGW(MDNS_TAG, "  SRV : %s.local:%u\n", r->hostname, r->port);
+        }
+        if (r->txt_count)
+        {
+            ESP_LOGW(MDNS_TAG, "  TXT : [%u] ", r->txt_count);
+            for (t = 0; t < r->txt_count; t++)
+            {
+                ESP_LOGW(MDNS_TAG, "%s=%s; ", r->txt[t].key, r->txt[t].value);
+            }
+            // printf("\n");
+        }
+        a = r->addr;
+        while (a)
+        {
+            if (a->addr.type == MDNS_IP_PROTOCOL_V6)
+            {
+                ESP_LOGW(MDNS_TAG, "  AAAA: " IPV6STR "\n", IPV62STR(a->addr.u_addr.ip6));
+            }
+            else
+            {
+                ESP_LOGW(MDNS_TAG, "  A   : " IPSTR "\n", IP2STR(&(a->addr.u_addr.ip4)));
 
+                if (r->hostname && strcmp(r->hostname, "funclick") == 0)
+                {
+                    char buf[16];
+                    sprintf(buf, "%d.%d.%d.%d", IP2STR(&(a->addr.u_addr.ip4)));
+                    // ESP_LOGI(TAG, "buf=[%s]", buf);
+                    // ESP_LOGI(TAG, "*buf=[%c]", *buf);
+                    // SocketServerIp = *&buf;
+                    // ESP_LOGI(TAG, "ServerIp Address=[%s]", SocketServerIp);
+                    // SocketServerIp = buf;
+                    strcpy(SocketServerIp, buf);
+
+                    ESP_LOGI(TAG, "ServerIp Value=[%s]", SocketServerIp);
+                    ESP_LOGW(MDNS_TAG, "Server Found at " IPSTR "", IP2STR(&(a->addr.u_addr.ip4)));
+                    // safeFree(buf);
+                }
+            }
+            a = a->next;
+        }
+        r = r->next;
+    }
+}
+mdns_result_t *results = NULL;
+int mdns_counter = 0;
+void find_mdns_service(const char *service_name, const char *proto)
+{
+    printStatusBottom("PLEASE WAIT");
+    mdns_counter++;
+    if (mdns_counter > 200)
+    {
+        mdns_counter = 0;
+        printStatusBottom("SRVR NOT FOUND");
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        // ESP_LOGW(TAG, "SHUTDOWN");
+        beep(NOTE_A4, 80, 0);
+        // beep(NOTE_A, 80, 100);
+        digitalWrite(POWER_PIN, LOW);
+        return;
+    }
+    else if (mdns_counter > 100)
+    {
+        // printStatusBottom("SRCH SRVR (" + mdns_counter + ")");
+        mdns_free();
+    }
+    else if (mdns_counter > 10)
+    {
+        ESP_LOGI(MDNS_TAG, "MDNS Counter %i", mdns_counter);
+        char statusMessage[50]; // Adjust the size as needed
+        snprintf(statusMessage, sizeof(statusMessage), "SRCH SRVR (%d)", mdns_counter);
+        printStatusBottom(statusMessage);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        // find_mdns_service(service_name, proto);
+        return;
+    }
+
+    ESP_LOGI(MDNS_TAG, "Query PTR: %s.%s.local", service_name, proto);
+
+    // esp_err_t err = mdns_query_srv(service_name, "funclick", proto, 3000, &results);
+    // esp_err_t err = mdns_query_srv(service_name, "_http", proto, 3000, &results);
+    // esp_err_t err = mdns_query( service_name, "_http", proto, MDNS_TYPE_SRV, 3000, 20, &results);
+    esp_err_t err = mdns_query(service_name, "_http", proto, MDNS_TYPE_A, 3000, 20, &results);
+    if (err)
+    {
+        ESP_LOGE(MDNS_TAG, "Query Failed %i", err);
+
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        find_mdns_service(service_name, proto);
+
+        return;
+    }
+    if (!results)
+    {
+        ESP_LOGW(MDNS_TAG, "No results found!");
+
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        find_mdns_service(service_name, proto);
+        return;
+    }
+    ESP_LOGI(MDNS_TAG, "Some Service found");
+
+    mdns_print_results(results);
+
+    // ESP_LOGI(MDNS_TAG, "Service found :%s.local", results->addr);
+    mdns_query_results_free(results);
+    if (strlen(SocketServerIp) > 0)
+    {
+        mdns_free();
+    }
+    else
+    {
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        find_mdns_service(service_name, proto);
+    }
+}
 void app_main()
 {
     ESP_LOGI(TAG, "app_main %s", FIRMWARE_VERSION);
@@ -1186,9 +1526,37 @@ void app_main()
     pinMode(BUTTON_5_LED, OUTPUT);
     pinMode(BUTTON_6_LED, OUTPUT);
 
+    ESP_LOGI(TAG, "[APP] Startup..");
+    ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
+    esp_log_level_set("*", ESP_LOG_VERBOSE);
+    esp_log_level_set("websocket_client", ESP_LOG_VERBOSE);
+    esp_log_level_set("transport_ws", ESP_LOG_VERBOSE);
+    esp_log_level_set("trans_tcp", ESP_LOG_VERBOSE);
     if (!ChargingFlag)
     {
+        ESP_LOGI(TAG, "CONNECTING TO WIFI..");
+        xTaskCreate(loop, "loop", 4096, NULL, 4, NULL);
         wifi_init_sta();
+
+        esp_err_t err = mdns_init();
+        if (err)
+        {
+            ESP_LOGW(MDNS_TAG, "MDNS Init failed: %d\n", err);
+            // return;
+        }
+        else
+        {
+            find_mdns_service("funclick", "_tcp");
+        }
+        if (strlen(SocketServerIp) > 0)
+        {
+            xTaskCreate(&ota_task, "ota_task", 8192, NULL, 1, NULL);
+            // ESP_LOGW(MDNS_TAG, "Starting WebSocket Task %c", SocketServerIp);
+            // ESP_LOGW(MDNS_TAG, "Starting WebSocket Task * %c", &SocketServerIp);
+            ESP_LOGW(MDNS_TAG, "Starting WebSocket Task & %s", SocketServerIp);
+            xTaskCreate(webSocketTask, "webSocketTask", 4096, NULL, 4, NULL);
+        }
         analogWrite(BUTTONS_LED_R, 255);
         analogWrite(BUTTONS_LED_G, 0);
         analogWrite(BUTTONS_LED_B, 255);
@@ -1200,21 +1568,14 @@ void app_main()
         digitalWrite(BUTTON_6_LED, HIGH);
     }
 
-    ESP_LOGI(TAG, "[APP] Startup..");
-    ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
-    esp_log_level_set("*", ESP_LOG_VERBOSE);
-    esp_log_level_set("websocket_client", ESP_LOG_VERBOSE);
-    esp_log_level_set("transport_ws", ESP_LOG_VERBOSE);
-    esp_log_level_set("trans_tcp", ESP_LOG_VERBOSE);
     if (!ChargingFlag)
     {
-        xTaskCreate(&ota_task, "ota_task", 8192, NULL, 1, NULL);
+        // xTaskCreate(&ota_task, "ota_task", 8192, NULL, 1, NULL);
     }
     ESP_LOGI(TAG, "webSocketTask start");
     if (!ChargingFlag)
     {
-        xTaskCreate(webSocketTask, "webSocketTask", 4096, NULL, 4, NULL);
+        // xTaskCreate(webSocketTask, "webSocketTask", 4096, NULL, 4, NULL);
     }
     // websocket_app_start();
     registerButton(BUTTON_1, 1);
@@ -1251,7 +1612,6 @@ void app_main()
     else
     {
 
-        xTaskCreate(loop, "loop", 4096, NULL, 4, NULL);
         xTaskCreate(ledLoop, "ledLoop", 4096, NULL, 4, NULL);
     }
 }
