@@ -20,7 +20,7 @@
 #define BAT_MON_PIN 1
 #define BAT_CHG 17
 #define BAT_STDBY 18
-#define FIRMWARE_VERSION "1.22"
+#define FIRMWARE_VERSION "1.23"
 #define MIN_BATTERY 3.2
 // #include "esp_lcd_panel_io_interface.h"
 #include "pitches.h"
@@ -128,6 +128,7 @@ rmt_transmit_config_t tx_config = {
 };
 bool ChargingFlag = false;
 int ledStatus = LED_ANIM;
+int prevLedStatus = LED_ANIM;
 int ledValueR = 0;
 int ledValueG = 0;
 int ledValueB = 0;
@@ -441,6 +442,11 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                             int value_blink = cJSON_GetObjectItem(event_data_object, "value_blink")->valueint;
                             if (value_blink == 1)
                             {
+                                if (ledStatus != LED_BLINK)
+                                {
+                                    prevLedStatus = ledStatus;
+                                }
+
                                 ledStatus = LED_BLINK;
                             }
                             else
@@ -855,7 +861,7 @@ void ledLoop(void *pvParameters)
     uint16_t hue = 0;
     uint16_t start_rgb = 0;
     bool blinkToggle = false;
-    int lastBlinkToggleMillis =0;
+    int lastBlinkToggleMillis = 0;
     int blinkCounter = 0;
     while (1)
     {
@@ -897,7 +903,7 @@ void ledLoop(void *pvParameters)
         else if (ledStatus == LED_BLINK)
         {
 
-            if ( lastBlinkToggleMillis < millis())
+            if (lastBlinkToggleMillis < millis())
             {
                 lastBlinkToggleMillis = millis() + ledValueBlinkRate;
                 blinkToggle = !blinkToggle;
@@ -922,9 +928,10 @@ void ledLoop(void *pvParameters)
                 }
             }
             ESP_LOGI(TAG, "blinkToggle %s", blinkToggle ? "true" : "false");
-            if (ledValueBlinkCounter>0 && blinkCounter > ledValueBlinkCounter)
+            if (ledValueBlinkCounter > 0 && blinkCounter > ledValueBlinkCounter)
             {
-                ledStatus = LED_COLOR;
+                // prevLedStatus
+                ledStatus = prevLedStatus;
                 blinkCounter = 0;
             }
         }
@@ -1460,7 +1467,7 @@ void app_main()
     {
         ESP_LOGI(TAG, "BUTTON_1 is pressed");
     }
-    if ((bat_chg_value < 70 || bat_stby_value < 70) && !(digitalRead(BUTTON_1) == LOW))
+    if (!usb_serial_jtag_is_connected() && (bat_chg_value < 70 || bat_stby_value < 70) && !(digitalRead(BUTTON_1) == LOW))
     {
         ChargingFlag = true;
         beep(NOTE_F6, 200, 0);
@@ -1529,10 +1536,20 @@ void app_main()
     ESP_LOGI(TAG, "[APP] Startup..");
     ESP_LOGI(TAG, "[APP] Free memory: %" PRIu32 " bytes", esp_get_free_heap_size());
     ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
-    esp_log_level_set("*", ESP_LOG_VERBOSE);
-    esp_log_level_set("websocket_client", ESP_LOG_VERBOSE);
-    esp_log_level_set("transport_ws", ESP_LOG_VERBOSE);
-    esp_log_level_set("trans_tcp", ESP_LOG_VERBOSE);
+    if (usb_serial_jtag_is_connected())
+    {
+        esp_log_level_set("*", ESP_LOG_VERBOSE);
+        esp_log_level_set("websocket_client", ESP_LOG_VERBOSE);
+        esp_log_level_set("transport_ws", ESP_LOG_VERBOSE);
+        esp_log_level_set("trans_tcp", ESP_LOG_VERBOSE);
+    }
+    else
+    {
+        esp_log_level_set("*", ESP_LOG_NONE);
+        esp_log_level_set("websocket_client", ESP_LOG_NONE);
+        esp_log_level_set("transport_ws", ESP_LOG_NONE);
+        esp_log_level_set("trans_tcp", ESP_LOG_NONE);
+    }
     if (!ChargingFlag)
     {
         ESP_LOGI(TAG, "CONNECTING TO WIFI..");
